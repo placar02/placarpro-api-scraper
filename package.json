@@ -1,0 +1,28 @@
+{
+  "name": "ApiPlacarPro",
+  "version": "0.1.0",
+  "description": "API de scraping e normalização de dados esportivos",
+  "main": "dist/index.js",
+  "repository": "https://github.com/EduardoPH/placarpro-api",
+  "author": "EduardoPH",
+  "license": "MIT",
+  "private": true,
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "nodemon": "^3.1.10",
+    "path": "^0.12.7",
+    "playwright": "^1.56.0",
+    "tsx": "^4.20.6"
+  },
+  "type": "module",
+  "scripts": {
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "dev": "nodemon --exec tsx src/index.ts"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.7.2"
+  }
+}
