@@ -8,6 +8,7 @@ import express from 'express';
 import { fetchLiveMatches } from './scrapers/live';
 import type { LiveMatchesResponse } from './scrapers/live';
 import { fetchOdds } from './scrapers/odds';
+import { fetchStatistics } from './scrapers/statistics';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -88,6 +89,23 @@ app.get('/odds/:eventId', async (req, res) => {
   }
 });
 
+app.get('/event/:eventId/statistics', async (req, res) => {
+  const { eventId } = req.params;
+  if (!eventId || eventId == ':eventId') {
+    return res.status(400).json({ error: 'eventId is required' });
+  }
+  try {
+    const statisticsData = await fetchStatistics(eventId);
+    if (!statisticsData) {
+      return res.status(404).json({ error: 'Statistics data not found' });
+    }
+    return res.status(200).json({ status: 200, data: statisticsData });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    return res.status(500).json({ error: 'Failed to fetch statistics data', message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on http://localhost:${PORT} 🌐`);
 
@@ -108,5 +126,10 @@ app.listen(PORT, () => {
   console.log(`  📊 Odds Data (default marketId=1): http://localhost:${PORT}/odds/:eventId`)
   console.log('    📝 Parameters for /odds/:eventId:');
   console.log(`     - eventId: string (path - required)`);
+  console.log(' ');
+  console.log(`  📈 Statistics Data: http://localhost:${PORT}/event/:eventId/statistics`)
+  console.log('    📝 Parameters for /event/:eventId/statistics:');
+  console.log(`     - eventId: string (path - required)`);
   console.log('----------------------------------------');
+
 });
