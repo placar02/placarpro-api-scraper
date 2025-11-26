@@ -34,7 +34,37 @@ export const eventsRouter = Router();
  *                   type: number
  *                   example: 200
  *                 data:
- *                   $ref: '#/components/schemas/Statistics'
+ *                   type: object
+ *                   properties:
+ *                     homeTeam:
+ *                       type: object
+ *                       properties:
+ *                         image:
+ *                           type: string
+ *                           example: /team/{teamId}/image
+ *                         imageSmall:
+ *                           type: string
+ *                           example: /team/{teamId}/image/small
+ *                     awayTeam:
+ *                       type: object
+ *                       properties:
+ *                         image:
+ *                           type: string
+ *                           example: /team/{teamId}/image
+ *                         imageSmall:
+ *                           type: string
+ *                           example: /team/{teamId}/image/small
+ *                     players:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         properties:
+ *                           image:
+ *                             type: string
+ *                             example: /player/{playerId}/image
+ *                           imageSmall:
+ *                             type: string
+ *                             example: /player/{playerId}/image/small
  *       400:
  *         description: EventId inválido
  *         content:
@@ -64,7 +94,28 @@ eventsRouter.get('/event/:eventId/statistics', async (req, res) => {
     if (!statisticsData) {
       return res.status(404).json({ error: 'Statistics data not found' });
     }
-    return res.status(200).json({ status: 200, data: statisticsData });
+
+    // Adicionar URLs de imagem ao resposta
+    const enhancedData = {
+      ...statisticsData,
+      homeTeam: {
+        ...statisticsData.homeTeam,
+        image: `/team/${statisticsData.homeTeam?.id}/image`,
+        imageSmall: `/team/${statisticsData.homeTeam?.id}/image/small`
+      },
+      awayTeam: {
+        ...statisticsData.awayTeam,
+        image: `/team/${statisticsData.awayTeam?.id}/image`,
+        imageSmall: `/team/${statisticsData.awayTeam?.id}/image/small`
+      },
+      players: statisticsData.players?.map((player: any) => ({
+        ...player,
+        image: `/player/${player.id}/image`,
+        imageSmall: `/player/${player.id}/image/small`
+      }))
+    };
+
+    return res.status(200).json({ status: 200, data: enhancedData });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     return res.status(500).json({ error: 'Failed to fetch statistics data', message });

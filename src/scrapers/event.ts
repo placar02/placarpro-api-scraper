@@ -121,7 +121,7 @@ export async function fetchEvent(
         }
         : undefined,
       startTime: event.startTimestamp,
-      currentTime: event.statusTime.timestamp,
+      currentTime: event.statusTime?.timestamp,
       features: {
         hasXg: event.hasXg,
         hasPlayerStats: event.hasEventPlayerStatistics,

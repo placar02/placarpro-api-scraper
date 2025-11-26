@@ -148,6 +148,12 @@ export const teamsRouter = express.Router();
  *                           type: string
  *                     lastUpdated:
  *                       type: number
+ *                     image:
+ *                       type: string
+ *                       example: /team/{teamId}/image
+ *                     imageSmall:
+ *                       type: string
+ *                       example: /team/{teamId}/image/small
  *       400:
  *         description: TeamId inválido
  *         content:
@@ -182,7 +188,14 @@ teamsRouter.get('/:teamId', async (req, res) => {
       return res.status(404).json({ error: 'Team data not found' });
     }
 
-    return res.status(200).json({ status: 200, data: teamData.data });
+    // Adicionar URLs de imagem à resposta
+    const enhancedData = {
+      ...teamData.data,
+      image: `/team/${teamId}/image`,
+      imageSmall: `/team/${teamId}/image/small`
+    };
+
+    return res.status(200).json({ status: 200, data: enhancedData });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Error in /team/:teamId:', err);

@@ -86,6 +86,12 @@ export const eventRouter = Router();
  *                           type: string
  *                         shortName:
  *                           type: string
+ *                         image:
+ *                           type: string
+ *                           example: /team/{teamId}/image
+ *                         imageSmall:
+ *                           type: string
+ *                           example: /team/{teamId}/image/small
  *                     awayTeam:
  *                       type: object
  *                       properties:
@@ -97,6 +103,12 @@ export const eventRouter = Router();
  *                           type: string
  *                         shortName:
  *                           type: string
+ *                         image:
+ *                           type: string
+ *                           example: /team/{teamId}/image
+ *                         imageSmall:
+ *                           type: string
+ *                           example: /team/{teamId}/image/small
  *                     score:
  *                       type: object
  *                       properties:
@@ -177,7 +189,22 @@ eventRouter.get('/event/:eventId', async (req, res) => {
       return res.status(404).json({ error: 'Event not found' });
     }
 
-    return res.status(200).json({ status: 200, data: eventData.data });
+    // Adicionar URLs de imagem à resposta
+    const enhancedData = {
+      ...eventData.data,
+      homeTeam: {
+        ...eventData.data.homeTeam,
+        image: `/team/${eventData.data.homeTeam?.id}/image`,
+        imageSmall: `/team/${eventData.data.homeTeam?.id}/image/small`
+      },
+      awayTeam: {
+        ...eventData.data.awayTeam,
+        image: `/team/${eventData.data.awayTeam?.id}/image`,
+        imageSmall: `/team/${eventData.data.awayTeam?.id}/image/small`
+      }
+    };
+
+    return res.status(200).json({ status: 200, data: enhancedData });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Error in /event/:eventId:', err);
