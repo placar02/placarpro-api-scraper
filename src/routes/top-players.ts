@@ -16,24 +16,28 @@ export const topPlayersRouter = express.Router();
  *         in: path
  *         description: ID único do time
  *         required: true
+ *         example: 2829
  *         schema:
  *           type: number
  *       - name: uniqueTournamentId
  *         in: query
  *         description: ID único do campeonato
  *         required: true
+ *         example: 1465
  *         schema:
  *           type: number
  *       - name: seasonId
  *         in: query
  *         description: ID da temporada
  *         required: true
+ *         example: 76953
  *         schema:
  *           type: number
  *       - name: retryOn403
  *         in: query
  *         description: Tenta novamente em caso de erro 403
  *         required: false
+ *         example: true
  *         schema:
  *           type: boolean
  *           default: true
@@ -164,24 +168,28 @@ topPlayersRouter.get('/:teamId/top-players', async (req, res) => {
  *         in: path
  *         description: ID único do time
  *         required: true
+ *         example: 2829
  *         schema:
  *           type: number
  *       - name: uniqueTournamentId
  *         in: path
  *         description: ID único do campeonato
  *         required: true
+ *         example: 1465
  *         schema:
  *           type: number
  *       - name: seasonId
  *         in: path
  *         description: ID da temporada
  *         required: true
+ *         example: 76953
  *         schema:
  *           type: number
  *       - name: retryOn403
  *         in: query
  *         description: Tenta novamente em caso de erro 403
  *         required: false
+ *         example: true
  *         schema:
  *           type: boolean
  *           default: true

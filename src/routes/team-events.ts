@@ -16,12 +16,14 @@ export const teamEventsRouter = express.Router();
  *         in: path
  *         description: ID único do time
  *         required: true
+ *         example: 2829
  *         schema:
  *           type: number
  *       - name: page
  *         in: query
  *         description: Número da página (padrão 0)
  *         required: false
+ *         example: 0
  *         schema:
  *           type: number
  *           default: 0
@@ -29,6 +31,7 @@ export const teamEventsRouter = express.Router();
  *         in: query
  *         description: Tenta novamente em caso de erro 403
  *         required: false
+ *         example: true
  *         schema:
  *           type: boolean
  *           default: true
@@ -160,94 +163,4 @@ teamEventsRouter.get('/:teamId/events/next', async (req, res) => {
   }
 });
 
-/**
- * @swagger
- * /team/{teamId}/events/next/{page}:
- *   get:
- *     summary: Obtém próximos eventos de um time com página específica
- *     description: Retorna a lista paginada de próximos eventos de um time
- *     tags:
- *       - Team
- *     parameters:
- *       - name: teamId
- *         in: path
- *         description: ID único do time
- *         required: true
- *         schema:
- *           type: number
- *       - name: page
- *         in: path
- *         description: Número da página
- *         required: true
- *         schema:
- *           type: number
- *       - name: retryOn403
- *         in: query
- *         description: Tenta novamente em caso de erro 403
- *         required: false
- *         schema:
- *           type: boolean
- *           default: true
- *     responses:
- *       200:
- *         description: Próximos eventos retornados com sucesso
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 status:
- *                   type: number
- *                   example: 200
- *                 data:
- *                   type: object
- *       400:
- *         description: Parâmetros inválidos
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       404:
- *         description: Eventos não encontrados
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Erro ao buscar próximos eventos
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- */
-teamEventsRouter.get('/:teamId/events/next/:page', async (req, res) => {
-  const { teamId, page: pageStr } = req.params;
-  const retryOn403 = req.query.retryOn403 === 'false' ? false : true;
 
-  if (!teamId || teamId == ':teamId') {
-    return res.status(400).json({ error: 'teamId is required' });
-  }
-
-  if (!pageStr || pageStr == ':page') {
-    return res.status(400).json({ error: 'page is required' });
-  }
-
-  const page = parseInt(pageStr, 10);
-  if (isNaN(page) || page < 0) {
-    return res.status(400).json({ error: 'page must be a non-negative integer' });
-  }
-
-  try {
-    const eventsData = await fetchTeamNextEvents(teamId, page, { retryOn403 });
-
-    if (!eventsData.data) {
-      return res.status(404).json({ error: 'Team events not found' });
-    }
-
-    return res.status(200).json({ status: 200, data: eventsData.data });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Unknown error';
-    console.error('Error in /team/:teamId/events/next/:page:', err);
-    return res.status(500).json({ error: 'Failed to fetch team events', message });
-  }
-});

@@ -211,7 +211,7 @@ imagesRouter.get('/player/:playerId/image', async (req, res) => {
  *         in: path
  *         description: ID único do jogador
  *         required: true
- *       example: 750
+ *         example: 750
  *         schema:
  *           type: number
  *     responses:
