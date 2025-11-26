@@ -11,6 +11,7 @@ import { healthRouter } from './routes/health';
 import { matchesRouter } from './routes/matches';
 import { oddsRouter } from './routes/odds';
 import { eventsRouter } from './routes/events';
+import { eventRouter } from './routes/event';
 import { standingsRouter } from './routes/standings';
 import { imagesRouter } from './routes/images';
 import { searchRouter } from './routes/search';
@@ -21,11 +22,18 @@ const PORT = process.env.PORT || 3001;
 // Swagger setup
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
+// Expose Swagger JSON
+app.get('/api-docs.json', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.send(swaggerSpec);
+});
+
 // Register routers
 app.use('/', healthRouter);
 app.use('/', matchesRouter);
 app.use('/', oddsRouter);
 app.use('/', eventsRouter);
+app.use('/', eventRouter);
 app.use('/', standingsRouter);
 app.use('/', imagesRouter);
 app.use('/', searchRouter);

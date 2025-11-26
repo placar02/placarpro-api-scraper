@@ -154,6 +154,7 @@ const options = {
     path.join(__dirname, 'routes/matches.ts'),
     path.join(__dirname, 'routes/odds.ts'),
     path.join(__dirname, 'routes/events.ts'),
+    path.join(__dirname, 'routes/event.ts'),
     path.join(__dirname, 'routes/standings.ts'),
     path.join(__dirname, 'routes/images.ts'),
     path.join(__dirname, 'routes/search.ts'),
