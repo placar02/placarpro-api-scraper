@@ -18,8 +18,13 @@ import { searchRouter } from './routes/search';
 import { teamsRouter } from './routes/teams';
 import { teamEventsRouter } from './routes/team-events';
 import { topPlayersRouter } from './routes/top-players';
+import cors from "cors";
 
 const app = express();
+
+
+app.use(cors());        // <-- precisa vir logo após criar o app
+app.use(express.json());
 const PORT = process.env.PORT || 3001;
 
 // Swagger setup

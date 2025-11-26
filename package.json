@@ -8,13 +8,14 @@
   "license": "MIT",
   "private": true,
   "dependencies": {
+    "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
-    "swagger-ui-express": "^5.0.1",
-    "swagger-jsdoc": "^6.2.8",
     "nodemon": "^3.1.10",
     "path": "^0.12.7",
     "playwright": "^1.56.0",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1",
     "tsx": "^4.20.6"
   },
   "type": "module",
@@ -24,6 +25,7 @@
     "dev": "nodemon --exec tsx src/index.ts"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",
     "@types/node": "^24.7.2",
     "@types/swagger-jsdoc": "^6.0.3",
