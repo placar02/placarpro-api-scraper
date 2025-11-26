@@ -66,66 +66,86 @@ export async function fetchEvent(
     }
 
     const { response, data } = result;
-    const event = data.event;
 
-    // Normalize the API response
+    // Verificar se data.event existe, caso contrário, usar data diretamente
+    const event = data.event || data;
+
+    if (!event || !event.id) {
+      console.error('Invalid event data structure:', data);
+      throw new Error('Invalid event data structure received from API');
+    }
+
+    // Normalize the API response with safe access to optional fields
     const normalizedData: NormalizedEvent = {
       id: event.id,
-      slug: event.slug,
+      slug: event.slug || '',
       status: {
-        code: event.status.code,
-        description: event.status.description,
-        type: event.status.type,
+        code: event.status?.code ?? 0,
+        description: event.status?.description || '',
+        type: event.status?.type || 'notstarted',
       },
       tournament: {
-        id: event.tournament.id,
-        name: event.tournament.name,
-        slug: event.tournament.slug,
+        id: event.tournament?.id ?? 0,
+        name: event.tournament?.name || '',
+        slug: event.tournament?.slug || '',
       },
       season: {
-        id: event.season.id,
-        name: event.season.name,
-        year: event.season.year,
+        id: event.season?.id ?? 0,
+        name: event.season?.name || '',
+        year: event.season?.year || '',
       },
       round: event.roundInfo?.round,
       homeTeam: {
-        id: event.homeTeam.id,
-        name: event.homeTeam.name,
-        slug: event.homeTeam.slug,
-        shortName: event.homeTeam.shortName,
+        id: event.homeTeam?.id ?? 0,
+        name: event.homeTeam?.name || '',
+        slug: event.homeTeam?.slug || '',
+        shortName: event.homeTeam?.shortName || event.homeTeam?.name || '',
       },
       awayTeam: {
-        id: event.awayTeam.id,
-        name: event.awayTeam.name,
-        slug: event.awayTeam.slug,
-        shortName: event.awayTeam.shortName,
+        id: event.awayTeam?.id ?? 0,
+        name: event.awayTeam?.name || '',
+        slug: event.awayTeam?.slug || '',
+        shortName: event.awayTeam?.shortName || event.awayTeam?.name || '',
       },
       score: {
-        home: event.homeScore.current ?? 0,
-        away: event.awayScore.current ?? 0,
-        homeDisplay: event.homeScore.display ?? 0,
-        awayDisplay: event.awayScore.display ?? 0,
+        home: event.homeScore?.current ?? 0,
+        away: event.awayScore?.current ?? 0,
+        homeDisplay: event.homeScore?.display ?? 0,
+        awayDisplay: event.awayScore?.display ?? 0,
       },
-      venue: {
-        id: event.venue.id,
-        name: event.venue.name,
-        slug: event.venue.slug,
-        city: event.venue.city.name,
-        capacity: event.venue.capacity,
+      venue: event.venue ? {
+        id: event.venue.id ?? 0,
+        name: event.venue.name || event.homeTeam?.venue?.name || 'Unknown',
+        slug: event.venue.slug || '',
+        city: event.venue.city?.name || event.homeTeam?.venue?.city?.name || '',
+        capacity: event.venue.capacity ?? event.homeTeam?.venue?.capacity ?? 0,
+      } : {
+        id: event.homeTeam?.venue?.id ?? 0,
+        name: event.homeTeam?.venue?.name || 'Unknown',
+        slug: event.homeTeam?.venue?.slug || '',
+        city: event.homeTeam?.venue?.city?.name || '',
+        capacity: event.homeTeam?.venue?.capacity ?? 0,
       },
       referee: event.referee
         ? {
-          id: event.referee.id,
-          name: event.referee.name,
-          slug: event.referee.slug,
+          id: event.referee.id ?? 0,
+          name: event.referee.name || 'Unknown',
+          slug: event.referee.slug || '',
         }
-        : undefined,
-      startTime: event.startTimestamp,
-      currentTime: event.statusTime?.timestamp,
+        : {
+          id: 0,
+          name: 'Unknown',
+          slug: 'unknown',
+        },
+      startTime: event.startTimestamp ?? 0,
+      currentTime: event.statusTime?.timestamp || event.time?.currentPeriodStartTimestamp,
+      time: event.time ? {
+        currentPeriodStartTimestamp: event.time.currentPeriodStartTimestamp
+      } : undefined,
       features: {
-        hasXg: event.hasXg,
-        hasPlayerStats: event.hasEventPlayerStatistics,
-        hasHeatMap: event.hasEventPlayerHeatMap,
+        hasXg: event.hasXg ?? false,
+        hasPlayerStats: event.hasEventPlayerStatistics ?? false,
+        hasHeatMap: event.hasEventPlayerHeatMap ?? false,
       },
     };
 

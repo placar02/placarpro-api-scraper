@@ -73,7 +73,20 @@ matchesRouter.get('/live-matches', async (req, res) => {
 
     const payload = result.events ?? (result as any).raw ?? {};
 
-    return res.status(200).json({ status: result.status ?? 200, data: payload });
+    // Add image URLs to each event
+    const eventsWithImages = Array.isArray(payload) ? payload.map((event: any) => ({
+      ...event,
+      homeTeam: {
+        ...event.homeTeam,
+        imageUrl: `/team/${event.homeTeam.id}/image`
+      },
+      awayTeam: {
+        ...event.awayTeam,
+        imageUrl: `/team/${event.awayTeam.id}/image`
+      }
+    })) : payload;
+
+    return res.status(200).json({ status: result.status ?? 200, data: eventsWithImages });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Error in /live-matches:', err);

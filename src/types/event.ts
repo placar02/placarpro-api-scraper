@@ -269,13 +269,16 @@ export interface NormalizedEvent {
     city: string;
     capacity: number;
   };
-  referee?: {
+  referee: {
     id: number;
     name: string;
     slug: string;
   };
   startTime: number;
-  currentTime: number;
+  currentTime?: number;
+  time?: {
+    currentPeriodStartTimestamp?: number;
+  };
   features: {
     hasXg: boolean;
     hasPlayerStats: boolean;

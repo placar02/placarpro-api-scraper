@@ -82,7 +82,17 @@ standingsRouter.get('/standings/:tournamentId/:seasonId', async (req, res) => {
       return res.status(404).json({ error: 'Standings data not found' });
     }
 
-    return res.status(200).json({ status: 200, data: standingsData.data });
+    // Adicionar URLs de imagem dos times à resposta
+    const enhancedData = {
+      ...standingsData.data,
+      teams: standingsData.data.teams?.map((team: any) => ({
+        ...team,
+        image: `/team/${team.teamId}/image`,
+        imageSmall: `/team/${team.teamId}/image/small`
+      })) || []
+    };
+
+    return res.status(200).json({ status: 200, data: enhancedData });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Error in /standings:', err);
