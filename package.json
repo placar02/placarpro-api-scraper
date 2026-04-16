@@ -22,13 +22,18 @@
   "scripts": {
     "start": "node dist/index.js",
     "build": "tsc",
-    "dev": "nodemon --exec tsx src/index.ts"
+    "dev": "nodemon --exec tsx src/index.ts",
+    "test": "vitest run",
+    "test:routes": "vitest run tests/routes.chain.test.ts --reporter=verbose"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",
     "@types/node": "^24.7.2",
+    "@types/supertest": "^6.0.3",
     "@types/swagger-jsdoc": "^6.0.3",
-    "@types/swagger-ui-express": "^4.1.5"
+    "@types/swagger-ui-express": "^4.1.5",
+    "supertest": "^7.1.4",
+    "vitest": "^3.2.4"
   }
 }

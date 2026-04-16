@@ -28,6 +28,23 @@ npm start
 ```
 
 If you prefer to run the compiled code directly and want to ensure `.env` is loaded, make sure `dist/index.js` is the compiled equivalent of `src/index.ts` which calls `dotenv.config()` before importing `server`.
+
+## Testes de rotas encadeados
+
+Para validar rotas a partir de dados reais de live matches:
+
+```bash
+npm run test:routes
+```
+
+Fluxo do teste:
+
+1. Chama `/live-matches` para obter `eventId`, `teamId`, `tournamentId` e `seasonId`.
+2. Testa rotas de evento com `eventId`.
+3. Testa rotas de time com `teamId`.
+4. Testa standings e top players com `tournamentId` e `seasonId`.
+
+O teste considera rota operacional quando retorna status `200`, `304` ou `404` (erro de dado ausente sem quebrar a rota).
 # placarpro-api
 # placarpro-api
 # placarpro-api

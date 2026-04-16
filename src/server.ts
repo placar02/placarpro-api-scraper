@@ -21,12 +21,12 @@ import { teamEventsRouter } from './routes/team-events';
 import { topPlayersRouter } from './routes/top-players';
 import cors from "cors";
 
-const app = express();
-
-
-app.use(cors());        // <-- precisa vir logo após criar o app
-app.use(express.json());
 const PORT = process.env.PORT || 3001;
+
+export const app = express();
+
+app.use(cors());
+app.use(express.json());
 
 // Swagger setup
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
@@ -51,13 +51,14 @@ app.use('/team', teamsRouter);
 app.use('/team', teamEventsRouter);
 app.use('/team', topPlayersRouter);
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server is running on http://localhost:${PORT} 🌐`);
-
-  console.log('Press Ctrl+C to stop the server.');
-  console.log('----------------------------------------');
-  console.log('📚 Documentation:');
-  console.log(`  📖 Swagger UI: http://localhost:${PORT}/api-docs`);
-  console.log(`  📝 OpenAPI JSON: http://localhost:${PORT}/api-docs.json`);
-  console.log('----------------------------------------');
-});
+export function startServer(port = PORT) {
+  return app.listen(port, () => {
+    console.log(`🚀 Server is running on http://localhost:${port} 🌐`);
+    console.log('Press Ctrl+C to stop the server.');
+    console.log('----------------------------------------');
+    console.log('📚 Documentation:');
+    console.log(`  📖 Swagger UI: http://localhost:${port}/api-docs`);
+    console.log(`  📝 OpenAPI JSON: http://localhost:${port}/api-docs.json`);
+    console.log('----------------------------------------');
+  });
+}
