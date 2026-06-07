@@ -161,6 +161,7 @@ const options = {
     path.join(__dirname, 'routes/teams.ts'),
     path.join(__dirname, 'routes/team-events.ts'),
     path.join(__dirname, 'routes/top-players.ts'),
+    path.join(__dirname, 'routes/analysis.ts'),
   ],
 };
 

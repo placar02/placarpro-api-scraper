@@ -2,7 +2,7 @@
   "name": "ApiPlacarPro",
   "version": "0.1.0",
   "description": "API de scraping e normalização de dados esportivos",
-  "main": "dist/index.js",
+  "main": "src/index.ts",
   "repository": "https://github.com/EduardoPH/placarpro-api",
   "author": "EduardoPH",
   "license": "MIT",
@@ -20,8 +20,8 @@
   },
   "type": "module",
   "scripts": {
-    "start": "node dist/index.js",
-    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "build": "node -e \"console.log('No build step required for scraper')\"",
     "dev": "nodemon --exec tsx src/index.ts",
     "test": "vitest run",
     "test:routes": "vitest run tests/routes.chain.test.ts --reporter=verbose"

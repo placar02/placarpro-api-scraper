@@ -1,8 +1,16 @@
 import { Router } from 'express';
 import { fetchLiveMatches } from '../scrapers/live';
 import type { LiveMatchesResponse } from '../scrapers/live';
+import { fetchScheduledMatches } from '../scrapers/scheduled';
 
 export const matchesRouter = Router();
+
+const getTodayDate = () => new Intl.DateTimeFormat('en-CA', {
+  timeZone: process.env.MATCHES_TIMEZONE || 'America/Sao_Paulo',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+}).format(new Date());
 
 /**
  * @swagger
@@ -91,5 +99,21 @@ matchesRouter.get('/live-matches', async (req, res) => {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Error in /live-matches:', err);
     return res.status(500).json({ error: 'Failed to fetch live matches', message });
+  }
+});
+
+matchesRouter.get('/scheduled-matches', async (req, res) => {
+  const retryOn403 = req.query.retryOn403 === 'false' ? false : true;
+  const date = typeof req.query.date === 'string' && req.query.date
+    ? req.query.date
+    : getTodayDate();
+
+  try {
+    const result = await fetchScheduledMatches(date, retryOn403);
+    return res.status(200).json({ status: result.status ?? 200, data: result.events || [] });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    console.error('Error in /scheduled-matches:', err);
+    return res.status(500).json({ error: 'Failed to fetch scheduled matches', message });
   }
 });

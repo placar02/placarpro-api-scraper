@@ -96,6 +96,9 @@ standingsRouter.get('/standings/:tournamentId/:seasonId', async (req, res) => {
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Error in /standings:', err);
+    if (message.includes('Failed to fetch standings') || message.includes('HTTP 403') || message.includes('HTTP 404')) {
+      return res.status(404).json({ error: 'Standings data not found', message });
+    }
     return res.status(500).json({ error: 'Failed to fetch standings data', message });
   }
 });

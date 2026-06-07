@@ -195,6 +195,9 @@ eventsRouter.get('/event/:eventId/incidents', async (req, res) => {
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Error in /event/:eventId/incidents:', err);
+    if (message.includes('HTTP 403') || message.includes('HTTP 404')) {
+      return res.status(404).json({ error: 'Incidents data not found', message });
+    }
     return res.status(500).json({ error: 'Failed to fetch incidents data', message });
   }
 });
@@ -272,6 +275,9 @@ eventsRouter.get('/event/:eventId/graph', async (req, res) => {
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Error in /event/:eventId/graph:', err);
+    if (message.includes('HTTP 403') || message.includes('HTTP 404')) {
+      return res.status(404).json({ error: 'Graph data not found', message });
+    }
     return res.status(500).json({ error: 'Failed to fetch graph data', message });
   }
 });
@@ -349,6 +355,9 @@ eventsRouter.get('/event/:eventId/streaks', async (req, res) => {
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Error in /event/:eventId/streaks:', err);
+    if (message.includes('HTTP 403') || message.includes('HTTP 404')) {
+      return res.status(404).json({ error: 'Streaks data not found', message });
+    }
     return res.status(500).json({ error: 'Failed to fetch streaks data', message });
   }
 });

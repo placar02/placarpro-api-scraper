@@ -1,3 +1,4 @@
+import { chromium, Browser } from 'playwright';
 import type { EventApiResponse, NormalizedEvent } from '../types/event';
 
 const SOFASCORE_BASE_URL = process.env.SOFASCORE_BASE_URL || 'https://www.sofascore.com/api/v1';
@@ -16,24 +17,32 @@ async function tryFetchEventFromUrl(
   url: string,
   retryOn403?: boolean
 ): Promise<{ response: Response; data: EventApiResponse } | null> {
+  let browser: Browser | null = null;
   try {
-    const headers: Record<string, string> = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    };
+    browser = await chromium.launch();
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+      extraHTTPHeaders: {
+        Origin: 'http://sofascore.com',
+        Referer: 'http://sofascore.com/',
+        Accept: 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
 
-    const response = await fetch(url, { headers });
+    const page = await context.newPage();
+    let response = await page.goto(url, { waitUntil: 'domcontentloaded' });
 
-    if (response.status === 403) {
+    if (response?.status() === 403) {
       if (retryOn403) {
         console.warn(`Received 403 for ${url}. Retrying...`);
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        return tryFetchEventFromUrl(url, false);
+        await page.waitForTimeout(250);
+        response = await page.goto(url, { waitUntil: 'domcontentloaded' });
       }
-      return null;
     }
 
-    if (!response.ok) {
-      console.warn(`HTTP ${response.status} for ${url}`);
+    if (!response || response.status() !== 200) {
+      console.warn(`HTTP ${response?.status() ?? 'no response'} for ${url}`);
       return null;
     }
 
@@ -42,6 +51,8 @@ async function tryFetchEventFromUrl(
   } catch (error) {
     console.warn(`Error fetching from ${url}:`, error);
     return null;
+  } finally {
+    if (browser) await browser.close();
   }
 }
 
