@@ -20,12 +20,13 @@
   },
   "type": "module",
   "scripts": {
-    "start": "tsx src/index.ts",
-    "build": "node -e \"console.log('No build step required for scraper')\"",
-    "dev": "nodemon --exec tsx src/index.ts",
-    "test": "vitest run",
-    "test:routes": "vitest run tests/routes.chain.test.ts --reporter=verbose"
-  },
+  "start": "tsx src/index.ts",
+  "build": "node -e \"console.log('No build step required for scraper')\"",
+  "postinstall": "playwright install chromium",
+  "dev": "nodemon --exec tsx src/index.ts",
+  "test": "vitest run",
+  "test:routes": "vitest run tests/routes.chain.test.ts --reporter=verbose"
+},
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",
