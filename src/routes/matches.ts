@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { fetchLiveMatches } from '../scrapers/live';
 import type { LiveMatchesResponse } from '../scrapers/live';
 import { fetchScheduledMatches } from '../scrapers/scheduled';
+import { fetch365Matches } from '../scrapers/scores365';
 
 export const matchesRouter = Router();
 
@@ -68,7 +69,9 @@ matchesRouter.get('/live-matches', async (req, res) => {
   const retryOn403 = req.query.retryOn403 === 'false' ? false : true;
 
   try {
-    const result: LiveMatchesResponse = await fetchLiveMatches({ ifNoneMatch, retryOn403 });
+    const result: LiveMatchesResponse = process.env.SCORES_PROVIDER === '365scores'
+      ? await fetch365Matches()
+      : await fetchLiveMatches({ ifNoneMatch, retryOn403 });
 
     if (result.status === 304) {
       if (result.etag) res.setHeader('ETag', result.etag as string);
@@ -109,7 +112,9 @@ matchesRouter.get('/scheduled-matches', async (req, res) => {
     : getTodayDate();
 
   try {
-    const result = await fetchScheduledMatches(date, retryOn403);
+    const result = process.env.SCORES_PROVIDER === '365scores'
+      ? await fetch365Matches(date)
+      : await fetchScheduledMatches(date, retryOn403);
     return res.status(200).json({ status: result.status ?? 200, data: result.events || [] });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';

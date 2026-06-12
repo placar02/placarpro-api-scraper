@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { fetchEvent } from '../scrapers/event';
+import { fetchEvent, SofaScoreBlockedError } from '../scrapers/event';
 
 export const eventRouter = Router();
 
@@ -208,6 +208,18 @@ eventRouter.get('/event/:eventId', async (req, res) => {
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Error in /event/:eventId:', err);
+
+    if (err instanceof SofaScoreBlockedError) {
+      return res.status(err.status).json({
+        ok: false,
+        error: 'SofaScore blocked request',
+        code: err.code,
+        message,
+        attempts: err.attempts,
+        hint: 'Configure SOFASCORE_PROXY_URL no .env com um proxy residencial/mobile ou rode a API em outra rede/IP.',
+      });
+    }
+
     return res.status(500).json({ error: 'Failed to fetch event', message });
   }
 });

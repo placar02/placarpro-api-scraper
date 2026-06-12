@@ -1,4 +1,4 @@
-import { fetchEvent } from '../scrapers/event';
+import { fetchEvent, SofaScoreBlockedError } from '../scrapers/event';
 import { fetchIncidents } from '../scrapers/incidents';
 import { fetchLineups } from '../scrapers/lineups';
 import { fetchOdds } from '../scrapers/odds';
@@ -21,10 +21,14 @@ interface LLMAnalysisResponse {
 }
 
 function buildRecommendation(data: Partial<BettingRecommendation>): BettingRecommendation {
+  const confidence = typeof data.confidence === 'number'
+    ? data.confidence <= 1 ? Math.round(data.confidence * 100) : data.confidence
+    : 50;
+
   return {
     market: data.market || 'unknown',
     recommendation: data.recommendation || 'No recommendation',
-    confidence: typeof data.confidence === 'number' ? data.confidence : 50,
+    confidence,
     rationale: data.rationale || '',
     meta: data.meta,
   };
@@ -231,8 +235,93 @@ function summarizeStreaks(streaksResp: any) {
   };
 }
 
+function summarize365Odds(game: any) {
+  const odds = Array.isArray(game?.bestOdds) ? game.bestOdds : [];
+  const predictions = game?.promotedPredictions?.predictions;
+
+  return {
+    markets: limitArray(odds, 8).map((line: any) => ({
+      market: line.lineType?.name || line.lineType?.title,
+      bookmaker: line.bookmaker?.name,
+      options: limitArray(line.options, 6).map((option: any) => ({
+        name: option.name,
+        odd: option.rate?.decimal,
+        trend: option.trend,
+      })),
+    })),
+    predictions: Array.isArray(predictions)
+      ? limitArray(predictions, 5).map((prediction: any) => ({
+        title: prediction.title,
+        totalVotes: prediction.totalVotes,
+        options: limitArray(prediction.options, 5).map((option: any) => ({
+          name: option.name,
+          percentage: option.vote?.percentage,
+          count: option.vote?.count,
+        })),
+      }))
+      : undefined,
+  };
+}
+
+function summarize365TopPerformers(game: any) {
+  const categories = game?.topPerformers?.categories;
+  if (!Array.isArray(categories)) return undefined;
+
+  const summarizePlayer = (player: any) => player ? ({
+    name: player.name,
+    position: player.positionName,
+    stats: limitArray(player.stats, 5).map((stat: any) => ({
+      name: stat.name,
+      value: stat.value,
+    })),
+  }) : undefined;
+
+  return limitArray(categories, 6).map((category: any) => ({
+    category: category.name,
+    homePlayer: summarizePlayer(category.homePlayer),
+    awayPlayer: summarizePlayer(category.awayPlayer),
+  }));
+}
+
+function build365LLMInput(raw: any, normalizedEvent: any, statisticsResp: any, incidentsResp: any, lineupsResp: any, streaksResp: any): LLMAnalysisInput {
+  const game = raw.game || {};
+
+  return {
+    event: {
+      id: normalizedEvent.id,
+      slug: normalizedEvent.slug,
+      source: '365scores',
+      tournament: normalizedEvent.tournament,
+      season: normalizedEvent.season,
+      round: normalizedEvent.round,
+      status: normalizedEvent.status,
+      startTimestamp: normalizedEvent.startTime,
+      homeTeam: normalizedEvent.homeTeam,
+      awayTeam: normalizedEvent.awayTeam,
+      score: normalizedEvent.score,
+      venue: normalizedEvent.venue,
+      gameTime: game.gameTime,
+      gameTimeDisplay: game.gameTimeDisplay,
+      statusText: game.statusText,
+      hasStats: game.hasStats,
+      hasLineups: game.hasLineups,
+    },
+    odds: summarize365Odds(game),
+    statistics: summarizeStatistics(statisticsResp),
+    incidents: summarizeIncidents(incidentsResp),
+    lineups: summarizeLineups(lineupsResp),
+    streaks: summarizeStreaks(streaksResp),
+    topPerformers: summarize365TopPerformers(game),
+  } as LLMAnalysisInput;
+}
+
 function buildLLMInput(event: any, oddsResp: any, statisticsResp: any, incidentsResp: any, lineupsResp: any, streaksResp: any): LLMAnalysisInput {
-  const normalizedEvent = event.event || event;
+  if (event?.raw?.game && event?.data) {
+    return build365LLMInput(event.raw, event.data, statisticsResp, incidentsResp, lineupsResp, streaksResp);
+  }
+
+  const sourceEvent = event?.raw?.event || event?.data || event;
+  const normalizedEvent = sourceEvent.event || sourceEvent;
 
   return {
     event: {
@@ -563,7 +652,20 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
     includeOdds = false,
     useOddsFallback = false,
   } = options;
-  const eventResp = await fetchEvent(eventId);
+  const eventResp = await fetchEvent(eventId).catch((err) => {
+    if (err instanceof SofaScoreBlockedError) {
+      return {
+        status: err.status,
+        raw: {
+          error: err.code,
+          message: err.message,
+          attempts: err.attempts,
+        },
+      } as any;
+    }
+
+    throw err;
+  });
 
   if (!eventResp || eventResp.status !== 200 || !eventResp.data) {
     return {
@@ -577,18 +679,19 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
   }
 
   const event = eventResp.data;
+  const is365ScoresProvider = process.env.SCORES_PROVIDER === '365scores';
   const [oddsResp, statisticsResp, incidentsResp, lineupsResp, streaksResp] = await Promise.all([
-    includeOdds || useOddsFallback ? safeFetch('odds', () => fetchOdds(eventId, 1)) : Promise.resolve(null),
-    safeFetch('statistics', () => fetchStatistics(eventId)),
-    safeFetch('incidents', () => fetchIncidents(eventId)),
-    safeFetch('lineups', () => fetchLineups(eventId)),
-    safeFetch('streaks', () => fetchStreaks(String(eventId))),
+    !is365ScoresProvider && (includeOdds || useOddsFallback) ? safeFetch('odds', () => fetchOdds(eventId, 1)) : Promise.resolve(null),
+    !is365ScoresProvider ? safeFetch('statistics', () => fetchStatistics(eventId)) : Promise.resolve(null),
+    !is365ScoresProvider ? safeFetch('incidents', () => fetchIncidents(eventId)) : Promise.resolve(null),
+    !is365ScoresProvider ? safeFetch('lineups', () => fetchLineups(eventId)) : Promise.resolve(null),
+    !is365ScoresProvider ? safeFetch('streaks', () => fetchStreaks(String(eventId))) : Promise.resolve(null),
   ]);
   let llmError: string | undefined;
 
   if (useLLM) {
     const llmInput = buildLLMInput(
-      eventResp.raw || eventResp.data,
+      { raw: eventResp.raw, data: eventResp.data },
       includeOdds ? oddsResp : null,
       statisticsResp,
       incidentsResp,

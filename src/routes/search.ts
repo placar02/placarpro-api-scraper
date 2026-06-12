@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { fetchSearch } from '../scrapers/search';
+import { fetch365SearchTeams } from '../scrapers/scores365';
 
 export const searchRouter = Router();
 
@@ -71,7 +72,9 @@ searchRouter.get('/search/teams', async (req, res) => {
   const pageNum = page ? parseInt(page as string, 10) : 0;
 
   try {
-    const searchData = await fetchSearch(q, pageNum, { retryOn403 });
+    const searchData = process.env.SCORES_PROVIDER === '365scores'
+      ? await fetch365SearchTeams(q, pageNum)
+      : await fetchSearch(q, pageNum, { retryOn403 });
 
     if (!searchData.data) {
       return res.status(404).json({ error: 'Search results not found' });

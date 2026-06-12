@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { fetchImage } from '../scrapers/images';
+import { get365ImageUrl } from '../scrapers/scores365';
 
 export const imagesRouter = Router();
 
@@ -54,6 +55,10 @@ imagesRouter.get('/team/:teamId/image', async (req, res) => {
   }
 
   try {
+    if (process.env.SCORES_PROVIDER === '365scores') {
+      return res.redirect(302, get365ImageUrl('team', teamId, 'large'));
+    }
+
     const imageResponse = await fetchImage('team', teamId);
     const imageBuffer = await imageResponse.arrayBuffer();
 
@@ -119,6 +124,10 @@ imagesRouter.get('/team/:teamId/image/small', async (req, res) => {
   }
 
   try {
+    if (process.env.SCORES_PROVIDER === '365scores') {
+      return res.redirect(302, get365ImageUrl('team', teamId, 'small'));
+    }
+
     const imageResponse = await fetchImage('team', teamId, { size: 'small' });
     const imageBuffer = await imageResponse.arrayBuffer();
 
@@ -184,6 +193,10 @@ imagesRouter.get('/player/:playerId/image', async (req, res) => {
   }
 
   try {
+    if (process.env.SCORES_PROVIDER === '365scores') {
+      return res.redirect(302, get365ImageUrl('player', playerId, 'large'));
+    }
+
     const imageResponse = await fetchImage('player', playerId);
     const imageBuffer = await imageResponse.arrayBuffer();
 
@@ -249,6 +262,10 @@ imagesRouter.get('/player/:playerId/image/small', async (req, res) => {
   }
 
   try {
+    if (process.env.SCORES_PROVIDER === '365scores') {
+      return res.redirect(302, get365ImageUrl('player', playerId, 'small'));
+    }
+
     const imageResponse = await fetchImage('player', playerId, { size: 'small' });
     const imageBuffer = await imageResponse.arrayBuffer();
 

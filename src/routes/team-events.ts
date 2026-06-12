@@ -1,5 +1,6 @@
 import express from 'express';
 import { fetchTeamNextEvents } from '../scrapers/team-events';
+import { fetch365TeamNextEvents } from '../scrapers/scores365';
 
 export const teamEventsRouter = express.Router();
 
@@ -149,7 +150,9 @@ teamEventsRouter.get('/:teamId/events/next', async (req, res) => {
   }
 
   try {
-    const eventsData = await fetchTeamNextEvents(teamId, page, { retryOn403 });
+    const eventsData = process.env.SCORES_PROVIDER === '365scores'
+      ? await fetch365TeamNextEvents(teamId)
+      : await fetchTeamNextEvents(teamId, page, { retryOn403 });
 
     if (!eventsData.data) {
       return res.status(404).json({ error: 'Team events not found' });

@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { fetchLineups } from '../scrapers/lineups';
+import { fetch365Lineups } from '../scrapers/scores365';
 
 export const lineupsRouter = Router();
 
@@ -13,7 +14,9 @@ lineupsRouter.get('/event/:eventId/lineups', async (req, res) => {
   }
 
   try {
-    const data = await fetchLineups(eventId);
+    const data = process.env.SCORES_PROVIDER === '365scores'
+      ? await fetch365Lineups(eventId)
+      : await fetchLineups(eventId);
     if (data.status === 200 && data.data) {
       // Optionally enrich player/team images here; for now return normalized data
       return res.status(200).json({ status: 200, data: data.data });

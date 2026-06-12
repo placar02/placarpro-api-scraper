@@ -1,5 +1,6 @@
 import express from 'express';
 import { fetchTeamInfo } from '../scrapers/team-info';
+import { fetch365TeamInfo } from '../scrapers/scores365';
 
 export const teamsRouter = express.Router();
 
@@ -182,7 +183,9 @@ teamsRouter.get('/:teamId', async (req, res) => {
   }
 
   try {
-    const teamData = await fetchTeamInfo(teamId, { retryOn403 });
+    const teamData = process.env.SCORES_PROVIDER === '365scores'
+      ? await fetch365TeamInfo(teamId)
+      : await fetchTeamInfo(teamId, { retryOn403 });
 
     if (!teamData.data) {
       return res.status(404).json({ error: 'Team data not found' });

@@ -72,6 +72,19 @@ standingsRouter.get('/standings/:tournamentId/:seasonId', async (req, res) => {
   }
 
   try {
+    if (process.env.SCORES_PROVIDER === '365scores') {
+      return res.status(200).json({
+        status: 200,
+        data: {
+          tournamentId: Number(tournamentId),
+          seasonId: Number(seasonId),
+          source: '365scores',
+          teams: [],
+          note: 'Standings endpoint is not mapped for 365Scores yet.',
+        },
+      });
+    }
+
     const standingsData = await fetchStandings(tournamentId, seasonId, { retryOn403 });
 
     if (standingsData.status === 304) {

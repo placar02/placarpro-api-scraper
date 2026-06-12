@@ -136,6 +136,21 @@ topPlayersRouter.get('/:teamId/top-players', async (req, res) => {
   }
 
   try {
+    if (process.env.SCORES_PROVIDER === '365scores') {
+      return res.status(200).json({
+        status: 200,
+        data: {
+          tournamentId: Number(uniqueTournamentId),
+          seasonId: Number(seasonId),
+          teamId: Number(teamId),
+          source: '365scores',
+          topPlayers: [],
+          totalPlayers: 0,
+          lastUpdated: Date.now(),
+        },
+      });
+    }
+
     const topPlayersData = await fetchTopPlayers(
       teamId,
       uniqueTournamentId as string,
@@ -242,6 +257,21 @@ topPlayersRouter.get('/:teamId/unique-tournament/:uniqueTournamentId/season/:sea
   }
 
   try {
+    if (process.env.SCORES_PROVIDER === '365scores') {
+      return res.status(200).json({
+        status: 200,
+        data: {
+          tournamentId: Number(uniqueTournamentId),
+          seasonId: Number(seasonId),
+          teamId: Number(teamId),
+          source: '365scores',
+          topPlayers: [],
+          totalPlayers: 0,
+          lastUpdated: Date.now(),
+        },
+      });
+    }
+
     const topPlayersData = await fetchTopPlayers(teamId, uniqueTournamentId, seasonId, { retryOn403 });
 
     if (!topPlayersData.data) {

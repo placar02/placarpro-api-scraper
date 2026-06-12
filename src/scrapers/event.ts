@@ -1,7 +1,32 @@
 import { chromium, Browser } from 'playwright';
+import { fetch365Event } from './scores365';
 import type { EventApiResponse, NormalizedEvent } from '../types/event';
 
 const SOFASCORE_BASE_URL = process.env.SOFASCORE_BASE_URL || 'https://www.sofascore.com/api/v1';
+const SOFASCORE_FALLBACK_BASE_URLS = [
+  SOFASCORE_BASE_URL,
+  'https://api.sofascore.com/api/v1',
+  'https://www.sofascore.com/api/v1',
+].filter((url, index, urls) => urls.indexOf(url) === index);
+const SOFASCORE_PROXY_URL =
+  process.env.SOFASCORE_PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+const SOFASCORE_BROWSER_CHANNELS = [
+  process.env.SOFASCORE_BROWSER_CHANNEL,
+  'chrome',
+  'msedge',
+].filter((channel): channel is string => Boolean(channel));
+
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+const BROWSER_HEADERS = {
+  Origin: 'https://www.sofascore.com',
+  Referer: 'https://www.sofascore.com/',
+  Accept: 'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7',
+  'Cache-Control': 'no-cache',
+  Pragma: 'no-cache',
+};
 
 interface FetchEventOptions {
   retryOn403?: boolean;
@@ -13,41 +38,146 @@ interface EventResponse {
   raw?: EventApiResponse;
 }
 
+export class SofaScoreBlockedError extends Error {
+  code = 'SOFASCORE_BLOCKED';
+  status = 502;
+  attempts: string[];
+
+  constructor(eventId: number | string, attempts: string[]) {
+    super(
+      `SofaScore blocked event ${eventId} after ${attempts.length} attempt(s): ${attempts.join(', ')}. ` +
+      'Configure SOFASCORE_PROXY_URL with a working residential/mobile proxy or use another network.'
+    );
+    this.name = 'SofaScoreBlockedError';
+    this.attempts = attempts;
+  }
+}
+
+interface FetchAttemptResult {
+  status: number;
+  data: EventApiResponse;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function launchSofascoreBrowser(): Promise<Browser> {
+  const launchOptions = {
+    proxy: SOFASCORE_PROXY_URL ? { server: SOFASCORE_PROXY_URL } : undefined,
+  };
+
+  for (const channel of SOFASCORE_BROWSER_CHANNELS) {
+    try {
+      return await chromium.launch({ ...launchOptions, channel });
+    } catch (error) {
+      console.warn(`Could not launch Playwright browser channel "${channel}":`, error);
+    }
+  }
+
+  return chromium.launch(launchOptions);
+}
+
+async function tryFetchEventWithFetch(
+  url: string,
+  retryOn403?: boolean
+): Promise<FetchAttemptResult | null> {
+  const headers = {
+    ...BROWSER_HEADERS,
+    'User-Agent': USER_AGENT,
+  };
+
+  let response = await fetch(url, { headers });
+
+  if (response.status === 403 && retryOn403) {
+    console.warn(`Received 403 for ${url} using fetch. Retrying...`);
+    await sleep(1500);
+    response = await fetch(url, { headers });
+  }
+
+  if (!response.ok) {
+    console.warn(`HTTP ${response.status} for ${url} using fetch`);
+    return null;
+  }
+
+  const data = (await response.json()) as EventApiResponse;
+  return { status: response.status, data };
+}
+
 async function tryFetchEventFromUrl(
   url: string,
   retryOn403?: boolean
-): Promise<{ response: Response; data: EventApiResponse } | null> {
+): Promise<FetchAttemptResult | null> {
+  const directResult = await tryFetchEventWithFetch(url, retryOn403).catch((error) => {
+    console.warn(`Fetch failed for ${url}:`, error);
+    return null;
+  });
+
+  if (directResult) {
+    return directResult;
+  }
+
   let browser: Browser | null = null;
   try {
-    browser = await chromium.launch();
+    browser = await launchSofascoreBrowser();
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-      extraHTTPHeaders: {
-        Origin: 'http://sofascore.com',
-        Referer: 'http://sofascore.com/',
-        Accept: 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
+      userAgent: USER_AGENT,
+      extraHTTPHeaders: BROWSER_HEADERS,
     });
 
     const page = await context.newPage();
-    let response = await page.goto(url, { waitUntil: 'domcontentloaded' });
 
-    if (response?.status() === 403) {
+    // Prime the session cookies before hitting the JSON API.
+    await page.goto('https://www.sofascore.com/', {
+      waitUntil: 'domcontentloaded',
+      timeout: 15000,
+    }).catch(() => undefined);
+
+    let browserFetchResult = await page.evaluate(async (apiUrl) => {
+      const response = await fetch(apiUrl, {
+        credentials: 'include',
+        headers: {
+          Accept: 'application/json, text/plain, */*',
+        },
+      });
+      const text = await response.text();
+
+      return {
+        ok: response.ok,
+        status: response.status,
+        text,
+      };
+    }, url);
+
+    if (browserFetchResult.status === 403) {
       if (retryOn403) {
-        console.warn(`Received 403 for ${url}. Retrying...`);
-        await page.waitForTimeout(250);
-        response = await page.goto(url, { waitUntil: 'domcontentloaded' });
+        console.warn(`Received 403 for ${url} using Playwright. Retrying...`);
+        await page.waitForTimeout(1500);
+        browserFetchResult = await page.evaluate(async (apiUrl) => {
+          const response = await fetch(apiUrl, {
+            credentials: 'include',
+            headers: {
+              Accept: 'application/json, text/plain, */*',
+            },
+          });
+          const text = await response.text();
+
+          return {
+            ok: response.ok,
+            status: response.status,
+            text,
+          };
+        }, url);
       }
     }
 
-    if (!response || response.status() !== 200) {
-      console.warn(`HTTP ${response?.status() ?? 'no response'} for ${url}`);
+    if (!browserFetchResult.ok) {
+      console.warn(`HTTP ${browserFetchResult.status} for ${url}`);
       return null;
     }
 
-    const data: EventApiResponse = await response.json();
-    return { response, data };
+    const data = JSON.parse(browserFetchResult.text) as EventApiResponse;
+    return { status: browserFetchResult.status, data };
   } catch (error) {
     console.warn(`Error fetching from ${url}:`, error);
     return null;
@@ -60,23 +190,37 @@ export async function fetchEvent(
   eventId: number | string,
   options: FetchEventOptions = {}
 ): Promise<EventResponse> {
+  if (process.env.SCORES_PROVIDER === '365scores') {
+    return fetch365Event(eventId) as Promise<EventResponse>;
+  }
+
   const { retryOn403 = true } = options;
 
   if (!eventId) {
     throw new Error('Event ID is required');
   }
 
-  const url = `${SOFASCORE_BASE_URL}/event/${eventId}`;
-
   try {
-    console.log(`Fetching event from: ${url}`);
-    const result = await tryFetchEventFromUrl(url, retryOn403);
+    const attempts: string[] = [];
+    let result: FetchAttemptResult | null = null;
 
-    if (!result) {
-      throw new Error('Failed to fetch event');
+    for (const baseUrl of SOFASCORE_FALLBACK_BASE_URLS) {
+      const url = `${baseUrl}/event/${eventId}`;
+      attempts.push(url);
+      console.log(`Fetching event from: ${url}`);
+
+      result = await tryFetchEventFromUrl(url, retryOn403);
+
+      if (result) {
+        break;
+      }
     }
 
-    const { response, data } = result;
+    if (!result) {
+      throw new SofaScoreBlockedError(eventId, attempts);
+    }
+
+    const { status, data } = result;
 
     // Verificar se data.event existe, caso contrário, usar data diretamente
     const event = data.event || data;
@@ -161,7 +305,7 @@ export async function fetchEvent(
     };
 
     return {
-      status: 200,
+      status,
       data: normalizedData,
       raw: data,
     };
