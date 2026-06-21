@@ -237,6 +237,11 @@ export interface NormalizedEvent {
     id: number;
     name: string;
     slug: string;
+    uniqueTournament?: {
+      id: number;
+      name: string;
+      slug: string;
+    };
   };
   season: {
     id: number;
@@ -273,6 +278,11 @@ export interface NormalizedEvent {
     id: number;
     name: string;
     slug: string;
+    yellowCards?: number;
+    redCards?: number;
+    yellowRedCards?: number;
+    games?: number;
+    country?: string;
   };
   startTime: number;
   currentTime?: number;

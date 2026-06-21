@@ -243,6 +243,13 @@ export async function fetchEvent(
         id: event.tournament?.id ?? 0,
         name: event.tournament?.name || '',
         slug: event.tournament?.slug || '',
+        uniqueTournament: event.tournament?.uniqueTournament
+          ? {
+            id: event.tournament.uniqueTournament.id ?? 0,
+            name: event.tournament.uniqueTournament.name || '',
+            slug: event.tournament.uniqueTournament.slug || '',
+          }
+          : undefined,
       },
       season: {
         id: event.season?.id ?? 0,
@@ -286,6 +293,11 @@ export async function fetchEvent(
           id: event.referee.id ?? 0,
           name: event.referee.name || 'Unknown',
           slug: event.referee.slug || '',
+          yellowCards: event.referee.yellowCards,
+          redCards: event.referee.redCards,
+          yellowRedCards: event.referee.yellowRedCards,
+          games: event.referee.games,
+          country: event.referee.country?.name,
         }
         : {
           id: 0,

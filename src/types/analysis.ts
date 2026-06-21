@@ -3,6 +3,9 @@ export interface BettingRecommendation {
   recommendation: string;
   confidence: number; // 0-100
   rationale: string;
+  riskLevel?: 'baixo' | 'medio' | 'alto';
+  dataSupport?: string[];
+  warningSigns?: string[];
   meta?: Record<string, unknown>;
 }
 
@@ -21,8 +24,15 @@ export interface AnalysisResult {
   confidence: number; // 0-100
   rationale: string;
   matchAnalysis?: string;
+  dataCoverage?: Record<string, unknown>;
+  keyFactors?: string[];
   homeAnalysis?: TeamAnalysis;
   awayAnalysis?: TeamAnalysis;
+  refereeAnalysis?: Record<string, unknown>;
+  playerAnalysis?: Record<string, unknown>;
+  marketBreakdown?: Record<string, unknown>;
+  confidenceDrivers?: string[];
+  avoidMarkets?: unknown[];
   riskAnalysis?: string;
   bestEntry?: BettingRecommendation;
   recommendations?: BettingRecommendation[];

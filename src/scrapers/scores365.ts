@@ -44,6 +44,12 @@ type Scores365Game = {
   };
   hasStats?: boolean;
   hasLineups?: boolean;
+  officials?: Array<{
+    id?: number;
+    name?: string;
+    nameForURL?: string;
+    countryId?: number;
+  }>;
 };
 
 type Scores365Response = {
@@ -139,10 +145,230 @@ function normalizeStatus(game: Scores365Game) {
   return { code: 6, description: game.statusText || 'Em andamento', type: 'inprogress' };
 }
 
+function toNumber(value: unknown): number {
+  const parsed = Number(String(value ?? '').replace(',', '.'));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function roundStat(value: number, digits = 2): number {
+  return Number(value.toFixed(digits));
+}
+
+function getGameMemberMap(game: any): Map<number, any> {
+  return new Map((game?.members || []).map((member: any) => [Number(member.id), member]));
+}
+
+function getCompetitorSide(game: any, competitorId: unknown): 'home' | 'away' | null {
+  const id = Number(competitorId);
+  if (id && id === Number(game?.homeCompetitor?.id)) return 'home';
+  if (id && id === Number(game?.awayCompetitor?.id)) return 'away';
+  return null;
+}
+
+function getPlayerSide(game: any, playerId: unknown): 'home' | 'away' | null {
+  const member = getGameMemberMap(game).get(Number(playerId));
+  return getCompetitorSide(game, member?.competitorId);
+}
+
+function isShotOnTarget(shot: any): boolean {
+  const outcomeId = Number(shot?.outcome?.id);
+  if ([0, 2].includes(outcomeId)) return true;
+  return toNumber(shot?.xgot) > 0;
+}
+
+function createStatItem(key: string, name: string, homeValue: number, awayValue: number, valueType: 'event' | 'team' = 'team') {
+  const formatValue = (value: number) => Number.isInteger(value) ? String(value) : String(roundStat(value));
+
+  return {
+    key,
+    name,
+    compare_code: homeValue === awayValue ? 0 : homeValue > awayValue ? 1 : 2,
+    statistics_type: 'positive',
+    value_type: valueType,
+    render_type: 1,
+    home: {
+      label: formatValue(homeValue),
+      value: roundStat(homeValue),
+      total: valueType === 'team' ? roundStat(homeValue) : undefined,
+    },
+    away: {
+      label: formatValue(awayValue),
+      value: roundStat(awayValue),
+      total: valueType === 'team' ? roundStat(awayValue) : undefined,
+    },
+  };
+}
+
+function aggregate365ShotChart(game: any) {
+  const members = getGameMemberMap(game);
+  const shots = Array.isArray(game?.chartEvents?.events) ? game.chartEvents.events : [];
+  const teamStats = {
+    home: { shots: 0, shotsOnTarget: 0, goals: 0, blockedShots: 0, xg: 0, xgot: 0 },
+    away: { shots: 0, shotsOnTarget: 0, goals: 0, blockedShots: 0, xg: 0, xgot: 0 },
+  };
+  const playerStats = new Map<number, any>();
+  const seenShots = new Set<string>();
+
+  for (const shot of shots) {
+    const shotSignature = [
+      shot.playerId,
+      shot.time,
+      shot.bodyPart,
+      shot.line,
+      shot.side,
+      shot.outcome?.id,
+      shot.outcome?.name,
+    ].join('|');
+    if (seenShots.has(shotSignature)) continue;
+    seenShots.add(shotSignature);
+
+    const playerId = Number(shot.playerId);
+    const member = members.get(playerId);
+    const side = getCompetitorSide(game, member?.competitorId) || (Number(shot.competitorNum) === 1 ? 'home' : Number(shot.competitorNum) === 2 ? 'away' : null);
+    if (!side) continue;
+
+    const outcomeId = Number(shot?.outcome?.id);
+    const onTarget = isShotOnTarget(shot);
+    const xg = toNumber(shot.xg);
+    const xgot = toNumber(shot.xgot);
+
+    teamStats[side].shots += 1;
+    teamStats[side].shotsOnTarget += onTarget ? 1 : 0;
+    teamStats[side].goals += outcomeId === 0 ? 1 : 0;
+    teamStats[side].blockedShots += outcomeId === 4 ? 1 : 0;
+    teamStats[side].xg += xg;
+    teamStats[side].xgot += xgot;
+
+    if (!playerStats.has(playerId)) {
+      playerStats.set(playerId, {
+        id: playerId,
+        name: member?.name || `Jogador ${playerId}`,
+        shortName: member?.shortName,
+        jerseyNumber: member?.jerseyNumber,
+        team: side,
+        competitorId: member?.competitorId,
+        shots: 0,
+        shotsOnTarget: 0,
+        goals: 0,
+        blockedShots: 0,
+        xg: 0,
+        xgot: 0,
+        shotsDetail: [],
+      });
+    }
+
+    const player = playerStats.get(playerId);
+    player.shots += 1;
+    player.shotsOnTarget += onTarget ? 1 : 0;
+    player.goals += outcomeId === 0 ? 1 : 0;
+    player.blockedShots += outcomeId === 4 ? 1 : 0;
+    player.xg += xg;
+    player.xgot += xgot;
+    player.shotsDetail.push({
+      time: shot.time,
+      xg: roundStat(xg),
+      xgot: roundStat(xgot),
+      bodyPart: shot.bodyPart,
+      outcome: shot.outcome?.name,
+    });
+  }
+
+  return {
+    teamStats,
+    players: [...playerStats.values()]
+      .map((player) => ({
+        ...player,
+        xg: roundStat(player.xg),
+        xgot: roundStat(player.xgot),
+        shotsDetail: player.shotsDetail.slice(0, 8),
+      }))
+      .sort((a, b) => b.shotsOnTarget - a.shotsOnTarget || b.shots - a.shots || b.xg - a.xg),
+    shots: shots.slice(0, 40),
+  };
+}
+
+function aggregate365Events(game: any) {
+  const events = Array.isArray(game?.events) ? game.events : [];
+  const cards = {
+    home: { yellow: 0, red: 0 },
+    away: { yellow: 0, red: 0 },
+  };
+
+  for (const event of events) {
+    const typeName = String(event?.eventType?.name || '').toLowerCase();
+    const side = getCompetitorSide(game, event?.competitorId);
+    if (!side) continue;
+
+    if (typeName.includes('cartao') || typeName.includes('cartão') || typeName.includes('yellow')) {
+      cards[side].yellow += 1;
+    }
+    if (typeName.includes('vermelho') || typeName.includes('red')) {
+      cards[side].red += 1;
+    }
+  }
+
+  return { cards };
+}
+
+function get365TopPerformerPlayers(game: any) {
+  const categories = game?.topPerformers?.categories;
+  if (!Array.isArray(categories)) return [];
+
+  return categories.flatMap((category: any) => [
+    category.homePlayer ? { ...category.homePlayer, team: 'home', category: category.name } : null,
+    category.awayPlayer ? { ...category.awayPlayer, team: 'away', category: category.name } : null,
+  ].filter(Boolean));
+}
+
+function get365OddsLines(game: any) {
+  const bestOdds = Array.isArray(game?.bestOdds) ? game.bestOdds : [];
+  const predictionOdds = Array.isArray(game?.promotedPredictions?.predictions)
+    ? game.promotedPredictions.predictions.map((prediction: any) => prediction.odds).filter(Boolean)
+    : [];
+
+  const byKey = new Map<string, any>();
+  for (const line of [...bestOdds, ...predictionOdds]) {
+    const key = String(line.lineId || `${line.lineTypeId}-${line.internalOption || ''}`);
+    if (!byKey.has(key)) byKey.set(key, line);
+  }
+
+  return [...byKey.values()];
+}
+
+function format365OddsOptionName(line: any, option: any, game: any) {
+  const marketName = String(line?.lineType?.name || line?.lineType?.title || '').toLowerCase();
+  const optionName = String(option?.name || '');
+  const optionNum = Number(option?.num);
+  const homeName = game?.homeCompetitor?.name || 'Casa';
+  const awayName = game?.awayCompetitor?.name || 'Fora';
+  const totalLine = line?.internalOptionValue || line?.internalOption || '';
+
+  if (marketName.includes('resultado')) {
+    if (optionNum === 1 || optionName === '1') return homeName;
+    if (optionNum === 2 || optionName.toLowerCase() === 'x') return 'Empate';
+    if (optionNum === 3 || optionName === '2') return awayName;
+  }
+
+  if (marketName.includes('primeiro a marcar')) {
+    if (optionNum === 1 || optionName.toLowerCase() === 'casa') return homeName;
+    if (optionNum === 2 || optionName.toLowerCase().includes('sem')) return 'Sem gol';
+    if (optionNum === 3 || optionName.toLowerCase() === 'fora') return awayName;
+  }
+
+  if (marketName.includes('total de gols')) {
+    const suffix = totalLine ? ` ${totalLine}` : '';
+    if (optionName.toLowerCase().includes('mais')) return `Mais de${suffix}`;
+    if (optionName.toLowerCase().includes('menos')) return `Menos de${suffix}`;
+  }
+
+  return optionName;
+}
+
 function normalizeEvent(game: Scores365Game, raw: Scores365Response): NormalizedEvent {
   const competition = raw.competitions?.find((item) => item.id === game.competitionId);
   const home = game.homeCompetitor || {};
   const away = game.awayCompetitor || {};
+  const official = Array.isArray(game.officials) ? game.officials[0] : undefined;
 
   return {
     id: game.id ?? 0,
@@ -185,9 +411,10 @@ function normalizeEvent(game: Scores365Game, raw: Scores365Response): Normalized
       capacity: game.venue?.capacity ?? 0,
     },
     referee: {
-      id: 0,
-      name: 'Unknown',
-      slug: 'unknown',
+      id: official?.id ?? 0,
+      name: official?.name || 'Unknown',
+      slug: official?.nameForURL || toSlug(official?.name),
+      country: undefined,
     },
     startTime: toTimestamp(game.startTime),
     currentTime: undefined,
@@ -294,7 +521,7 @@ export async function fetch365Matches(date?: string): Promise<{ status: number; 
 export async function fetch365Odds(eventId: number | string) {
   const raw = await fetch365<Scores365Response>('/game/', { gameId: eventId });
   const game = raw.game;
-  const odds = Array.isArray((game as any)?.bestOdds) ? (game as any).bestOdds : [];
+  const odds = get365OddsLines(game as any);
 
   if (!game?.id) return null;
 
@@ -307,7 +534,8 @@ export async function fetch365Odds(eventId: number | string) {
     suspended: false,
     choices: (line.options || []).map((option: any) => ({
       id: option.num,
-      name: option.name,
+      name: format365OddsOptionName(line, option, game),
+      raw_name: option.name,
       decimal_odds: option.rate?.decimal,
       fractional_odds: option.rate?.fractional,
       american_odds: option.rate?.american,
@@ -340,59 +568,157 @@ export async function fetch365Lineups(eventId: number | string) {
 
   if (!game?.id) return { status: 404, raw };
 
-  const topPerformers = game.topPerformers?.categories || [];
+  const topPerformers = get365TopPerformerPlayers(game);
+  const toLineupPlayer = (player: any) => ({
+    avgRating: undefined,
+    player: {
+      id: player.id,
+      name: player.name,
+      slug: player.nameForURL,
+      shortName: player.shortName,
+      position: player.positionShortName || player.positionName,
+    },
+    teamId: player.team === 'home' ? game.homeCompetitor?.id : game.awayCompetitor?.id,
+    shirtNumber: player.jerseyNumber,
+    position: player.positionName || player.positionShortName || player.category,
+    substitute: false,
+    captain: false,
+    stats: player.stats || [],
+  });
 
   return {
     status: 200,
     raw,
     data: {
-      confirmed: Boolean(game.hasLineups),
+      confirmed: Boolean(game.hasLineups || topPerformers.length),
       source: '365scores',
       home: {
         team: game.homeCompetitor,
         formation: undefined,
-        players: [],
-        topPerformers: topPerformers.map((category: any) => category.homePlayer).filter(Boolean),
+        players: topPerformers.filter((player: any) => player.team === 'home').map(toLineupPlayer),
+        topPerformers: topPerformers.filter((player: any) => player.team === 'home'),
       },
       away: {
         team: game.awayCompetitor,
         formation: undefined,
-        players: [],
-        topPerformers: topPerformers.map((category: any) => category.awayPlayer).filter(Boolean),
+        players: topPerformers.filter((player: any) => player.team === 'away').map(toLineupPlayer),
+        topPerformers: topPerformers.filter((player: any) => player.team === 'away'),
       },
     },
   };
 }
 
 export async function fetch365Statistics(eventId: number | string) {
-  const event = await fetch365Event(eventId);
-  if (!event.data) return null;
+  const raw = await fetch365<Scores365Response>('/game/', { gameId: eventId });
+  const game = raw.game as any;
+  if (!game?.id) return null;
+
+  const normalized = normalizeEvent(game, raw);
+  const shotStats = aggregate365ShotChart(game);
+  const eventStats = aggregate365Events(game);
+  const { home, away } = shotStats.teamStats;
+  const cards = eventStats.cards;
+  const items = [
+    createStatItem('shots', 'Total de chutes', home.shots, away.shots),
+    createStatItem('shotsOnTarget', 'Chutes no gol', home.shotsOnTarget, away.shotsOnTarget),
+    createStatItem('blockedShots', 'Chutes bloqueados', home.blockedShots, away.blockedShots),
+    createStatItem('goalsFromShotChart', 'Gols no shot chart', home.goals, away.goals),
+    createStatItem('xg', 'Gols esperados (xG)', roundStat(home.xg), roundStat(away.xg)),
+    createStatItem('xgot', 'xG no alvo (xGOT)', roundStat(home.xgot), roundStat(away.xgot)),
+    createStatItem('yellowCards', 'Cartoes amarelos', cards.home.yellow, cards.away.yellow),
+    createStatItem('redCards', 'Cartoes vermelhos', cards.home.red, cards.away.red),
+  ];
 
   return {
     event_id: Number(eventId),
     source: '365scores',
-    homeTeam: event.data.homeTeam,
-    awayTeam: event.data.awayTeam,
-    players: [],
-    by_period: {},
-    raw: event.raw,
+    homeTeam: normalized.homeTeam,
+    awayTeam: normalized.awayTeam,
+    players: shotStats.players,
+    shotChart: shotStats.shots.map((shot: any) => ({
+      time: shot.time,
+      playerId: shot.playerId,
+      team: getPlayerSide(game, shot.playerId),
+      xg: roundStat(toNumber(shot.xg)),
+      xgot: roundStat(toNumber(shot.xgot)),
+      bodyPart: shot.bodyPart,
+      outcome: shot.outcome?.name,
+    })),
+    by_period: {
+      ALL: {
+        period: 'ALL',
+        groups_by_name: {
+          '365Scores Team Stats': {
+            group_name: '365Scores Team Stats',
+            items,
+            total_items: items.length,
+          },
+        },
+        group_order: ['365Scores Team Stats'],
+        total_groups: 1,
+        total_items: items.length,
+      },
+    },
+    summary: {
+      periods: ['ALL'],
+      total_groups: 1,
+      total_items: items.length,
+      source: 'chartEvents',
+      hasShotChart: shotStats.shots.length > 0,
+      playerStatsCount: shotStats.players.length,
+    },
+    raw,
   };
 }
 
 export async function fetch365Incidents(eventId: number | string) {
-  const event = await fetch365Event(eventId);
-  if (!event.data) return { status: 404, raw: event.raw };
+  const raw = await fetch365<Scores365Response>('/game/', { gameId: eventId });
+  const game = raw.game as any;
+  if (!game?.id) return { status: 404, raw };
+
+  const members = getGameMemberMap(game);
+  const incidents = (game.events || []).map((event: any, index: number) => {
+    const member = members.get(Number(event.playerId));
+    const typeName = String(event.eventType?.name || '').toLowerCase();
+    const isCard = typeName.includes('cartao') || typeName.includes('cartão') || typeName.includes('card');
+    const isGoal = typeName.includes('gol') || typeName.includes('goal');
+    const isSubstitution = typeName.includes('substitution') || typeName.includes('substitu');
+
+    return {
+      id: event.num || index + 1,
+      eventId: Number(eventId),
+      type: isCard ? 'card' : isGoal ? 'goal' : isSubstitution ? 'substitution' : event.eventType?.name,
+      class: event.eventType?.subTypeName || event.eventType?.name,
+      time: event.gameTime,
+      addedTime: event.addedTime,
+      isHome: getCompetitorSide(game, event.competitorId) === 'home',
+      player: member ? {
+        id: member.id,
+        name: member.name,
+        slug: member.nameForURL,
+        jerseyNumber: member.jerseyNumber,
+      } : undefined,
+      goalScorer: isGoal && member ? {
+        id: member.id,
+        name: member.name,
+        slug: member.nameForURL,
+        jerseyNumber: member.jerseyNumber,
+      } : undefined,
+      cardType: isCard ? event.eventType?.name : undefined,
+      rawType: event.eventType,
+    };
+  });
 
   return {
     status: 200,
-    raw: event.raw,
+    raw,
     data: {
       eventId: Number(eventId),
       source: '365scores',
-      incidents: [],
+      incidents,
       teamColors: {
-        home: undefined,
-        away: undefined,
+        home: game.homeCompetitor?.color,
+        away: game.awayCompetitor?.color,
       },
     },
   };

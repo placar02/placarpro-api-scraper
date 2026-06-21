@@ -4,6 +4,7 @@ import { fetchLineups } from '../scrapers/lineups';
 import { fetchOdds } from '../scrapers/odds';
 import { fetchStatistics } from '../scrapers/statistics';
 import { fetchStreaks } from '../scrapers/streaks';
+import { fetchTopPlayers } from '../scrapers/top-players';
 import type { AnalysisResult, AnalyzeOptions, BettingRecommendation } from '../types/analysis';
 
 interface LLMAnalysisInput {
@@ -13,6 +14,9 @@ interface LLMAnalysisInput {
   incidents?: any;
   lineups?: any;
   streaks?: any;
+  topPlayers?: any;
+  refereeProfile?: any;
+  playerProps?: any;
 }
 
 interface LLMAnalysisResponse {
@@ -30,6 +34,9 @@ function buildRecommendation(data: Partial<BettingRecommendation>): BettingRecom
     recommendation: data.recommendation || 'No recommendation',
     confidence,
     rationale: data.rationale || '',
+    riskLevel: data.riskLevel,
+    dataSupport: Array.isArray(data.dataSupport) ? data.dataSupport : undefined,
+    warningSigns: Array.isArray(data.warningSigns) ? data.warningSigns : undefined,
     meta: data.meta,
   };
 }
@@ -140,7 +147,7 @@ function enrichRecommendationWithRealOdd(recommendation: BettingRecommendation, 
     .map((choice) => ({ choice, score: scoreOddMatch(recommendation, choice) }))
     .sort((a, b) => b.score - a.score)[0];
 
-  if (!best || best.score < 2) return recommendation;
+  if (!best || best.score < 3) return recommendation;
 
   return {
     ...recommendation,
@@ -173,7 +180,7 @@ function summarizeStatistics(statisticsResp: any) {
   if (!statisticsResp?.by_period) return undefined;
 
   const periods = Object.entries(statisticsResp.by_period).slice(0, 3);
-  return periods.map(([period, periodData]: [string, any]) => ({
+  const teamPeriods = periods.map(([period, periodData]: [string, any]) => ({
     period,
     groups: Object.values(periodData.groups_by_name || {}).map((group: any) => ({
       group: group.group_name,
@@ -184,6 +191,28 @@ function summarizeStatistics(statisticsResp: any) {
       })),
     })),
   }));
+  const players = Array.isArray(statisticsResp.players)
+    ? limitArray(statisticsResp.players, 12).map((player: any) => ({
+      name: player.name,
+      team: player.team,
+      shots: player.shots,
+      shotsOnTarget: player.shotsOnTarget,
+      goals: player.goals,
+      xg: player.xg,
+      xgot: player.xgot,
+      shotsDetail: limitArray(player.shotsDetail, 4),
+    }))
+    : undefined;
+  const shotChart = Array.isArray(statisticsResp.shotChart)
+    ? limitArray(statisticsResp.shotChart, 20)
+    : undefined;
+
+  return {
+    teamPeriods,
+    players,
+    shotChart,
+    summary: statisticsResp.summary,
+  };
 }
 
 function summarizeIncidents(incidentsResp: any) {
@@ -204,24 +233,87 @@ function summarizeLineups(lineupsResp: any) {
   const data = lineupsResp?.data || lineupsResp;
   if (!data || (!data.home && !data.away)) return undefined;
 
-  const summarizeSide = (side: any) => ({
-    formation: side?.formation,
-    missingPlayers: limitArray(side?.missingPlayers, 8).map((item: any) => ({
-      name: item.player?.name || item.name,
-      reason: item.reason,
-    })),
-    starters: limitArray((side?.players || []).filter((player: any) => !player.substitute), 11).map((item: any) => ({
+  const summarizePlayer = (item: any) => ({
       name: item.player?.name,
+      id: item.player?.id,
       position: item.position,
+      shirtNumber: item.shirtNumber,
       rating: item.avgRating,
       captain: item.captain,
-    })),
+      stats: item.stats,
   });
+  const summarizeSide = (side: any) => {
+    const starters = (side?.players || []).filter((player: any) => !player.substitute);
+    const bench = (side?.players || []).filter((player: any) => player.substitute);
+    const keyStarters = [...starters]
+      .filter((player: any) => Number.isFinite(Number(player.avgRating)))
+      .sort((a: any, b: any) => Number(b.avgRating) - Number(a.avgRating));
+
+    return {
+      formation: side?.formation,
+      missingPlayers: limitArray(side?.missingPlayers, 8).map((item: any) => ({
+        name: item.player?.name || item.name,
+        reason: item.reason,
+      })),
+      starters: limitArray(starters, 11).map(summarizePlayer),
+      keyStartersByRating: limitArray(keyStarters, 5).map(summarizePlayer),
+      bench: limitArray(bench, 5).map(summarizePlayer),
+    };
+  };
 
   return {
     confirmed: data.confirmed,
     home: summarizeSide(data.home),
     away: summarizeSide(data.away),
+  };
+}
+
+function summarizeTopPlayers(topPlayersResp: any) {
+  if (!topPlayersResp) return undefined;
+
+  const summarizeTeam = (team: any) => {
+    const players = team?.data?.topPlayers || team?.topPlayers;
+    if (!Array.isArray(players)) return undefined;
+
+    return limitArray(players, 8).map((player: any) => ({
+      name: player.playerName,
+      id: player.playerId,
+      position: player.playerPosition,
+      rating: player.rating,
+      appearances: player.appearances,
+      playedEnough: player.playedEnough,
+    }));
+  };
+
+  return {
+    home: summarizeTeam(topPlayersResp.home),
+    away: summarizeTeam(topPlayersResp.away),
+  };
+}
+
+function buildRefereeProfile(event: any) {
+  const referee = event?.referee;
+  if (!referee || !referee.id) return undefined;
+
+  const games = Number(referee.games);
+  const yellowCards = Number(referee.yellowCards);
+  const redCards = Number(referee.redCards);
+  const yellowRedCards = Number(referee.yellowRedCards);
+
+  return {
+    id: referee.id,
+    name: referee.name,
+    country: referee.country,
+    games: Number.isFinite(games) ? games : undefined,
+    yellowCards: Number.isFinite(yellowCards) ? yellowCards : undefined,
+    redCards: Number.isFinite(redCards) ? redCards : undefined,
+    yellowRedCards: Number.isFinite(yellowRedCards) ? yellowRedCards : undefined,
+    yellowCardsPerGame: Number.isFinite(games) && games > 0 && Number.isFinite(yellowCards)
+      ? Number((yellowCards / games).toFixed(2))
+      : undefined,
+    redCardsPerGame: Number.isFinite(games) && games > 0 && Number.isFinite(redCards)
+      ? Number((redCards / games).toFixed(2))
+      : undefined,
   };
 }
 
@@ -236,7 +328,14 @@ function summarizeStreaks(streaksResp: any) {
 }
 
 function summarize365Odds(game: any) {
-  const odds = Array.isArray(game?.bestOdds) ? game.bestOdds : [];
+  const bestOdds = Array.isArray(game?.bestOdds) ? game.bestOdds : [];
+  const predictionOdds = Array.isArray(game?.promotedPredictions?.predictions)
+    ? game.promotedPredictions.predictions.map((prediction: any) => prediction.odds).filter(Boolean)
+    : [];
+  const odds = [...new Map([...bestOdds, ...predictionOdds].map((line: any) => [
+    String(line.lineId || `${line.lineTypeId}-${line.internalOption || ''}`),
+    line,
+  ])).values()];
   const predictions = game?.promotedPredictions?.predictions;
 
   return {
@@ -244,7 +343,8 @@ function summarize365Odds(game: any) {
       market: line.lineType?.name || line.lineType?.title,
       bookmaker: line.bookmaker?.name,
       options: limitArray(line.options, 6).map((option: any) => ({
-        name: option.name,
+        name: format365OddsOptionName(line, option, game),
+        rawName: option.name,
         odd: option.rate?.decimal,
         trend: option.trend,
       })),
@@ -263,11 +363,41 @@ function summarize365Odds(game: any) {
   };
 }
 
+function format365OddsOptionName(line: any, option: any, game: any) {
+  const marketName = String(line?.lineType?.name || line?.lineType?.title || '').toLowerCase();
+  const optionName = String(option?.name || '');
+  const optionNum = Number(option?.num);
+  const homeName = game?.homeCompetitor?.name || 'Casa';
+  const awayName = game?.awayCompetitor?.name || 'Fora';
+  const totalLine = line?.internalOptionValue || line?.internalOption || '';
+
+  if (marketName.includes('resultado')) {
+    if (optionNum === 1 || optionName === '1') return homeName;
+    if (optionNum === 2 || optionName.toLowerCase() === 'x') return 'Empate';
+    if (optionNum === 3 || optionName === '2') return awayName;
+  }
+
+  if (marketName.includes('primeiro a marcar')) {
+    if (optionNum === 1 || optionName.toLowerCase() === 'casa') return homeName;
+    if (optionNum === 2 || optionName.toLowerCase().includes('sem')) return 'Sem gol';
+    if (optionNum === 3 || optionName.toLowerCase() === 'fora') return awayName;
+  }
+
+  if (marketName.includes('total de gols')) {
+    const suffix = totalLine ? ` ${totalLine}` : '';
+    if (optionName.toLowerCase().includes('mais')) return `Mais de${suffix}`;
+    if (optionName.toLowerCase().includes('menos')) return `Menos de${suffix}`;
+  }
+
+  return optionName;
+}
+
 function summarize365TopPerformers(game: any) {
   const categories = game?.topPerformers?.categories;
   if (!Array.isArray(categories)) return undefined;
 
   const summarizePlayer = (player: any) => player ? ({
+    id: player.id,
     name: player.name,
     position: player.positionName,
     stats: limitArray(player.stats, 5).map((stat: any) => ({
@@ -281,6 +411,37 @@ function summarize365TopPerformers(game: any) {
     homePlayer: summarizePlayer(category.homePlayer),
     awayPlayer: summarizePlayer(category.awayPlayer),
   }));
+}
+
+function summarize365PlayerProps(game: any) {
+  const topPerformers = game?.topPerformers?.categories;
+  const props: any[] = [];
+
+  if (Array.isArray(topPerformers)) {
+    for (const category of topPerformers) {
+      for (const [side, player] of [['home', category.homePlayer], ['away', category.awayPlayer]] as const) {
+        if (!player) continue;
+
+        props.push({
+          source: 'topPerformers',
+          team: side,
+          category: category.name,
+          playerId: player.id,
+          player: player.name,
+          position: player.positionName,
+          stats: limitArray(player.stats, 5).map((stat: any) => ({
+            name: stat.name,
+            value: stat.value,
+          })),
+        });
+      }
+    }
+  }
+
+  return {
+    available: props.length > 0,
+    props: limitArray(props, 12),
+  };
 }
 
 function build365LLMInput(raw: any, normalizedEvent: any, statisticsResp: any, incidentsResp: any, lineupsResp: any, streaksResp: any): LLMAnalysisInput {
@@ -300,22 +461,24 @@ function build365LLMInput(raw: any, normalizedEvent: any, statisticsResp: any, i
       awayTeam: normalizedEvent.awayTeam,
       score: normalizedEvent.score,
       venue: normalizedEvent.venue,
+      referee: normalizedEvent.referee,
       gameTime: game.gameTime,
       gameTimeDisplay: game.gameTimeDisplay,
       statusText: game.statusText,
       hasStats: game.hasStats,
       hasLineups: game.hasLineups,
     },
-    odds: summarize365Odds(game),
     statistics: summarizeStatistics(statisticsResp),
     incidents: summarizeIncidents(incidentsResp),
     lineups: summarizeLineups(lineupsResp),
     streaks: summarizeStreaks(streaksResp),
     topPerformers: summarize365TopPerformers(game),
+    refereeProfile: buildRefereeProfile(normalizedEvent),
+    playerProps: summarize365PlayerProps(game),
   } as LLMAnalysisInput;
 }
 
-function buildLLMInput(event: any, oddsResp: any, statisticsResp: any, incidentsResp: any, lineupsResp: any, streaksResp: any): LLMAnalysisInput {
+function buildLLMInput(event: any, oddsResp: any, statisticsResp: any, incidentsResp: any, lineupsResp: any, streaksResp: any, topPlayersResp?: any): LLMAnalysisInput {
   if (event?.raw?.game && event?.data) {
     return build365LLMInput(event.raw, event.data, statisticsResp, incidentsResp, lineupsResp, streaksResp);
   }
@@ -344,7 +507,34 @@ function buildLLMInput(event: any, oddsResp: any, statisticsResp: any, incidents
     incidents: summarizeIncidents(incidentsResp),
     lineups: summarizeLineups(lineupsResp),
     streaks: summarizeStreaks(streaksResp),
+    topPlayers: summarizeTopPlayers(topPlayersResp),
+    refereeProfile: buildRefereeProfile(normalizedEvent),
   };
+}
+
+function isMeaningfulId(value: unknown): value is number | string {
+  if (typeof value === 'number') return value > 0;
+  return typeof value === 'string' && value.trim() !== '' && value !== '0';
+}
+
+async function fetchTopPlayersForEvent(event: any) {
+  const uniqueTournamentId = event?.tournament?.uniqueTournament?.id ?? event?.tournament?.id;
+  const seasonId = event?.season?.id;
+  const homeTeamId = event?.homeTeam?.id;
+  const awayTeamId = event?.awayTeam?.id;
+
+  if (!isMeaningfulId(uniqueTournamentId) || !isMeaningfulId(seasonId)) return null;
+
+  const [home, away] = await Promise.all([
+    isMeaningfulId(homeTeamId)
+      ? safeFetch('home top players', () => fetchTopPlayers(String(homeTeamId), String(uniqueTournamentId), String(seasonId)))
+      : Promise.resolve(null),
+    isMeaningfulId(awayTeamId)
+      ? safeFetch('away top players', () => fetchTopPlayers(String(awayTeamId), String(uniqueTournamentId), String(seasonId)))
+      : Promise.resolve(null),
+  ]);
+
+  return { home, away };
 }
 
 function normalizeAzureEndpoint(endpoint: string): string {
@@ -422,13 +612,36 @@ async function callLLMAnalysis(input: LLMAnalysisInput): Promise<LLMAnalysisResp
 
   try {
     const prompt = `Voce e um analista profissional de apostas em futebol.
-Analise os dados da partida em profundidade. Compare mandante e visitante usando contexto do jogo, forma recente/streaks, escalacoes, desfalques, estatisticas, incidentes e placar/status.
-Nao escolha entradas por cotacao, odd baixa, odd favorita ou probabilidade implicita de mercado. A recomendacao deve nascer da leitura tecnica da partida.
-Se odds forem enviadas nos dados, use apenas como contexto secundario de mercado e nunca como motivo principal da entrada.
+Analise os dados da partida em profundidade. Compare mandante e visitante usando contexto do jogo, forma recente/streaks, escalacoes, desfalques, top players, estatisticas, incidentes, arbitro e placar/status.
+Use o perfil do arbitro para mercados de cartoes quando houver dados de jogos, amarelos, vermelhos ou cartoes por jogo.
+Use escalacoes, top players, posicoes, ratings e estatisticas de finalizacao/chances para avaliar mercados de jogador, como chute no gol, finalizacao, gol ou assistencia.
+Na fonte 365scores, considere que ha dados de jogador se existir qualquer um destes blocos: statistics.players, statistics.shotChart, topPerformers ou playerProps. Nao marque playerAnalysis.available como false quando esses blocos existirem.
+So recomende mercado de jogador quando existir suporte nos dados esportivos enviados. Se houver playerProps/topPerformers/statistics.players, use esses dados para explicar gol, finalizacao ou chute no gol; se faltar estatistica individual de finalizacao, diga a incerteza e prefira mercados de time.
+Na fonte 365scores, o arbitro pode vir em event.referee vindo de officials. Se houver nome do arbitro mas sem media historica de cartoes, marque refereeAnalysis.available como true, informe que o arbitro foi identificado, e classifique cardsTrend como "historico indisponivel" em vez de "indisponivel". Use estatisticas de cartoes do jogo quando existirem.
+Considere tambem mercados de gols, ambas marcam, vencedor, dupla chance, handicap, escanteios, cartoes e entradas ao vivo quando os dados sustentarem.
+Nao escolha entradas por cotacao, odd baixa, odd favorita, voto popular, predicao de mercado ou probabilidade implicita de mercado. A recomendacao deve nascer somente da leitura tecnica da partida.
+Se algum dado de odd, cotacao, relatedLines, prediction ou mercado aparecer acidentalmente nos dados, ignore completamente para a decisao e para a justificativa.
 Se algum bloco de dados estiver ausente, explique a incerteza sem inventar fatos.
+Se a partida for pre-match, diferencie leitura provavel de fato confirmado.
+Evite frases genericas. Cite os dados concretos recebidos: status, local, top performers, escalacoes, estatisticas, desfalques, shot chart, incidentes e perfil de arbitro.
 Retorne APENAS um JSON valido neste formato:
 {
+  "dataCoverage": {
+    "source": "365scores ou sofascore",
+    "hasLineups": true,
+    "hasTopPerformers": true,
+    "hasPlayerProps": true,
+    "hasShotChart": true,
+    "hasStatistics": true,
+    "hasReferee": true,
+    "missingData": ["dados ausentes que limitam a analise"]
+  },
   "matchAnalysis": "leitura geral da partida em portugues, com contexto, ritmo provavel ou leitura ao vivo",
+  "keyFactors": [
+    "fator decisivo 1 com impacto de aposta",
+    "fator decisivo 2 com impacto de aposta",
+    "fator decisivo 3 com impacto de aposta"
+  ],
   "homeAnalysis": {
     "team": "nome do mandante",
     "strengths": ["forca 1", "forca 2"],
@@ -443,23 +656,63 @@ Retorne APENAS um JSON valido neste formato:
     "tacticalReading": "como o visitante tende a se comportar",
     "bettingImpact": "como isso afeta as entradas"
   },
+  "refereeAnalysis": {
+    "available": true,
+    "summary": "leitura do arbitro para cartoes",
+    "cardsTrend": "alto, medio, baixo ou indisponivel",
+    "bettingImpact": "como isso impacta over/under cartoes"
+  },
+  "playerAnalysis": {
+    "available": true,
+    "mainPlayers": [
+      {
+        "team": "time",
+        "player": "nome",
+        "role": "funcao",
+        "whyRelevant": "por que importa para gol, assistencia ou chute",
+        "supportedMarkets": ["mercado de jogador que os dados sustentam"]
+      }
+    ],
+    "unsupportedPlayerMarkets": ["mercados de jogador que nao devem ser recomendados por falta de dado"]
+  },
+  "marketBreakdown": {
+    "goals": "leitura para over/under e ambas marcam",
+    "winner": "leitura para resultado, dupla chance ou handicap",
+    "cards": "leitura para cartoes",
+    "corners": "leitura para escanteios",
+    "playerProps": "leitura para jogador",
+    "liveAngle": "como mudar a entrada ao vivo se o jogo estiver em andamento"
+  },
   "recommendations": [
     {
       "market": "nome do mercado",
       "recommendation": "entrada objetiva",
       "confidence": 0,
-      "rationale": "analise detalhada em portugues explicando por que essa entrada faz sentido"
+      "riskLevel": "baixo, medio ou alto",
+      "dataSupport": ["dado 1 que sustenta", "dado 2 que sustenta"],
+      "warningSigns": ["sinal que pode invalidar", "incerteza relevante"],
+      "rationale": "analise detalhada em portugues explicando por que essa entrada faz sentido com base nos dados disponiveis"
     }
   ],
   "bestRecommendation": {
     "market": "nome do mercado",
     "recommendation": "melhor entrada",
     "confidence": 0,
+    "riskLevel": "baixo, medio ou alto",
+    "dataSupport": ["principais dados de apoio"],
+    "warningSigns": ["principais riscos"],
     "rationale": "por que esta e a melhor entrada"
   },
+  "confidenceDrivers": ["o que aumenta a confianca", "o que reduz a confianca"],
+  "avoidMarkets": [
+    {
+      "market": "mercado a evitar",
+      "reason": "por que nao tem valor ou nao tem dados suficientes"
+    }
+  ],
   "riskAnalysis": "principais riscos que podem invalidar a entrada"
 }
-Inclua pelo menos 3 recomendacoes, escolha a melhor entrada com disciplina e nunca use texto fora do JSON.`;
+Inclua entre 5 e 8 recomendacoes quando houver dados suficientes, cubra categorias diferentes de mercado, escolha a melhor entrada com disciplina e nunca use texto fora do JSON.`;
 
     const requestBody = {
       messages: [
@@ -467,7 +720,7 @@ Inclua pelo menos 3 recomendacoes, escolha a melhor entrada com disciplina e nun
         { role: 'user', content: `${prompt}\n\nDados:\n${JSON.stringify(input)}` }
       ],
       temperature: 0.2,
-      max_tokens: 1400,
+      max_tokens: 3200,
     };
 
     const url = `${normalizeAzureEndpoint(endpoint)}openai/deployments/${deploymentName}/chat/completions?api-version=2024-02-15-preview`;
@@ -525,8 +778,15 @@ Inclua pelo menos 3 recomendacoes, escolha a melhor entrada com disciplina e nun
 
     const result = selectBestRecommendation(recommendations, eventData?.id ?? 'unknown', 'azure-openai');
     result.matchAnalysis = typeof parsed.matchAnalysis === 'string' ? parsed.matchAnalysis : undefined;
+    result.dataCoverage = parsed.dataCoverage;
+    result.keyFactors = Array.isArray(parsed.keyFactors) ? parsed.keyFactors : undefined;
     result.homeAnalysis = parsed.homeAnalysis;
     result.awayAnalysis = parsed.awayAnalysis;
+    result.refereeAnalysis = parsed.refereeAnalysis;
+    result.playerAnalysis = parsed.playerAnalysis;
+    result.marketBreakdown = parsed.marketBreakdown;
+    result.confidenceDrivers = Array.isArray(parsed.confidenceDrivers) ? parsed.confidenceDrivers : undefined;
+    result.avoidMarkets = Array.isArray(parsed.avoidMarkets) ? parsed.avoidMarkets : undefined;
     result.riskAnalysis = typeof parsed.riskAnalysis === 'string' ? parsed.riskAnalysis : undefined;
     result.bestEntry = parsed.bestRecommendation ? buildRecommendation(parsed.bestRecommendation) : recommendations[0];
     result.meta = { source: 'azure-openai', rawResponse: json, eventId: eventData?.id ?? 'unknown' };
@@ -680,12 +940,13 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
 
   const event = eventResp.data;
   const is365ScoresProvider = process.env.SCORES_PROVIDER === '365scores';
-  const [oddsResp, statisticsResp, incidentsResp, lineupsResp, streaksResp] = await Promise.all([
+  const [oddsResp, statisticsResp, incidentsResp, lineupsResp, streaksResp, topPlayersResp] = await Promise.all([
     !is365ScoresProvider && (includeOdds || useOddsFallback) ? safeFetch('odds', () => fetchOdds(eventId, 1)) : Promise.resolve(null),
     !is365ScoresProvider ? safeFetch('statistics', () => fetchStatistics(eventId)) : Promise.resolve(null),
     !is365ScoresProvider ? safeFetch('incidents', () => fetchIncidents(eventId)) : Promise.resolve(null),
     !is365ScoresProvider ? safeFetch('lineups', () => fetchLineups(eventId)) : Promise.resolve(null),
     !is365ScoresProvider ? safeFetch('streaks', () => fetchStreaks(String(eventId))) : Promise.resolve(null),
+    useLLM && !is365ScoresProvider ? fetchTopPlayersForEvent(event) : Promise.resolve(null),
   ]);
   let llmError: string | undefined;
 
@@ -696,7 +957,8 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
       statisticsResp,
       incidentsResp,
       lineupsResp,
-      streaksResp
+      streaksResp,
+      topPlayersResp
     );
     const llmAnalysis = await callLLMAnalysis(llmInput);
     if (llmAnalysis.result) return llmAnalysis.result;
