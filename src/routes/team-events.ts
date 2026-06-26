@@ -1,6 +1,8 @@
 import express from 'express';
 import { fetchTeamNextEvents } from '../scrapers/team-events';
+import { fetchAiScoreTeamNextEvents } from '../scrapers/aiscore';
 import { fetch365TeamNextEvents } from '../scrapers/scores365';
+import { fetchOgolTeamNextEvents } from '../scrapers/ogol';
 
 export const teamEventsRouter = express.Router();
 
@@ -152,7 +154,11 @@ teamEventsRouter.get('/:teamId/events/next', async (req, res) => {
   try {
     const eventsData = process.env.SCORES_PROVIDER === '365scores'
       ? await fetch365TeamNextEvents(teamId)
-      : await fetchTeamNextEvents(teamId, page, { retryOn403 });
+      : process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolTeamNextEvents(teamId)
+      : process.env.SCORES_PROVIDER === 'aiscore'
+        ? await fetchAiScoreTeamNextEvents(teamId)
+        : await fetchTeamNextEvents(teamId, page, { retryOn403 });
 
     if (!eventsData.data) {
       return res.status(404).json({ error: 'Team events not found' });

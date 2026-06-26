@@ -44,4 +44,5 @@ export interface AnalyzeOptions {
   useLLM?: boolean;
   includeOdds?: boolean;
   useOddsFallback?: boolean;
+  includeEnrichment?: boolean;
 }

@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { fetchOdds } from '../scrapers/odds';
+import { fetchAiScoreOdds } from '../scrapers/aiscore';
 import { fetch365Odds } from '../scrapers/scores365';
+import { fetchOgolOdds } from '../scrapers/ogol';
 
 export const oddsRouter = Router();
 
@@ -68,7 +70,11 @@ oddsRouter.get('/odds/:eventId/:marketId', async (req, res) => {
   try {
     const oddsData = process.env.SCORES_PROVIDER === '365scores'
       ? await fetch365Odds(eventId)
-      : await fetchOdds(eventId, marketIdNum);
+      : process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolOdds(eventId)
+      : process.env.SCORES_PROVIDER === 'aiscore'
+        ? await fetchAiScoreOdds(eventId)
+        : await fetchOdds(eventId, marketIdNum);
     if (!oddsData) {
       return res.status(404).json({ error: 'Odds data not found' });
     }
@@ -136,7 +142,11 @@ oddsRouter.get('/odds/:eventId', async (req, res) => {
   try {
     const oddsData = process.env.SCORES_PROVIDER === '365scores'
       ? await fetch365Odds(eventId)
-      : await fetchOdds(eventId, marketIdNum);
+      : process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolOdds(eventId)
+      : process.env.SCORES_PROVIDER === 'aiscore'
+        ? await fetchAiScoreOdds(eventId)
+        : await fetchOdds(eventId, marketIdNum);
     if (!oddsData) {
       return res.status(404).json({ error: 'Odds data not found' });
     }

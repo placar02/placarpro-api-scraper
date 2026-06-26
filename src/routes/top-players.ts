@@ -136,14 +136,14 @@ topPlayersRouter.get('/:teamId/top-players', async (req, res) => {
   }
 
   try {
-    if (process.env.SCORES_PROVIDER === '365scores') {
+    if (process.env.SCORES_PROVIDER === '365scores' || process.env.SCORES_PROVIDER === 'aiscore' || process.env.SCORES_PROVIDER === 'ogol') {
       return res.status(200).json({
         status: 200,
         data: {
           tournamentId: Number(uniqueTournamentId),
           seasonId: Number(seasonId),
-          teamId: Number(teamId),
-          source: '365scores',
+          teamId,
+          source: process.env.SCORES_PROVIDER,
           topPlayers: [],
           totalPlayers: 0,
           lastUpdated: Date.now(),
@@ -257,14 +257,14 @@ topPlayersRouter.get('/:teamId/unique-tournament/:uniqueTournamentId/season/:sea
   }
 
   try {
-    if (process.env.SCORES_PROVIDER === '365scores') {
+    if (process.env.SCORES_PROVIDER === '365scores' || process.env.SCORES_PROVIDER === 'aiscore' || process.env.SCORES_PROVIDER === 'ogol') {
       return res.status(200).json({
         status: 200,
         data: {
           tournamentId: Number(uniqueTournamentId),
           seasonId: Number(seasonId),
-          teamId: Number(teamId),
-          source: '365scores',
+          teamId,
+          source: process.env.SCORES_PROVIDER,
           topPlayers: [],
           totalPlayers: 0,
           lastUpdated: Date.now(),

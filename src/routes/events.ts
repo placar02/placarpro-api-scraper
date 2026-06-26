@@ -4,7 +4,9 @@ import { fetchStandings } from '../scrapers/standings';
 import { fetchIncidents } from '../scrapers/incidents';
 import { fetchGraph } from '../scrapers/graph';
 import { fetchStreaks } from '../scrapers/streaks';
+import { fetchAiScoreGraph, fetchAiScoreIncidents, fetchAiScoreStatistics, fetchAiScoreStreaks } from '../scrapers/aiscore';
 import { fetch365Graph, fetch365Incidents, fetch365Statistics, fetch365Streaks } from '../scrapers/scores365';
+import { fetchOgolGraph, fetchOgolIncidents, fetchOgolStatistics, fetchOgolStreaks } from '../scrapers/ogol';
 
 export const eventsRouter = Router();
 
@@ -93,7 +95,11 @@ eventsRouter.get('/event/:eventId/statistics', async (req, res) => {
   try {
     const statisticsData = process.env.SCORES_PROVIDER === '365scores'
       ? await fetch365Statistics(eventId)
-      : await fetchStatistics(eventId);
+      : process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolStatistics(eventId)
+      : process.env.SCORES_PROVIDER === 'aiscore'
+        ? await fetchAiScoreStatistics(eventId)
+        : await fetchStatistics(eventId);
     if (!statisticsData) {
       return res.status(404).json({ error: 'Statistics data not found' });
     }
@@ -190,7 +196,11 @@ eventsRouter.get('/event/:eventId/incidents', async (req, res) => {
   try {
     const incidentsData = process.env.SCORES_PROVIDER === '365scores'
       ? await fetch365Incidents(eventId)
-      : await fetchIncidents(eventId, { retryOn403 });
+      : process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolIncidents(eventId)
+      : process.env.SCORES_PROVIDER === 'aiscore'
+        ? await fetchAiScoreIncidents(eventId)
+        : await fetchIncidents(eventId, { retryOn403 });
 
     if (!incidentsData.data) {
       return res.status(404).json({ error: 'Incidents data not found' });
@@ -272,7 +282,11 @@ eventsRouter.get('/event/:eventId/graph', async (req, res) => {
   try {
     const graphData = process.env.SCORES_PROVIDER === '365scores'
       ? await fetch365Graph(eventId)
-      : await fetchGraph(eventId, { retryOn403 });
+      : process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolGraph(eventId)
+      : process.env.SCORES_PROVIDER === 'aiscore'
+        ? await fetchAiScoreGraph(eventId)
+        : await fetchGraph(eventId, { retryOn403 });
 
     if (!graphData.data) {
       return res.status(404).json({ error: 'Graph data not found' });
@@ -354,7 +368,11 @@ eventsRouter.get('/event/:eventId/streaks', async (req, res) => {
   try {
     const streaksData = process.env.SCORES_PROVIDER === '365scores'
       ? await fetch365Streaks(eventId)
-      : await fetchStreaks(eventId, { retryOn403 });
+      : process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolStreaks(eventId)
+      : process.env.SCORES_PROVIDER === 'aiscore'
+        ? await fetchAiScoreStreaks(eventId)
+        : await fetchStreaks(eventId, { retryOn403 });
 
     if (!streaksData.data) {
       return res.status(404).json({ error: 'Streaks data not found' });

@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { createAiScoreStandingsPlaceholder } from '../scrapers/aiscore';
 import { fetchStandings } from '../scrapers/standings';
 
 export const standingsRouter = Router();
@@ -82,6 +83,24 @@ standingsRouter.get('/standings/:tournamentId/:seasonId', async (req, res) => {
           teams: [],
           note: 'Standings endpoint is not mapped for 365Scores yet.',
         },
+      });
+    }
+    if (process.env.SCORES_PROVIDER === 'ogol') {
+      return res.status(200).json({
+        status: 200,
+        data: {
+          tournamentId: Number(tournamentId),
+          seasonId: Number(seasonId),
+          source: 'ogol',
+          teams: [],
+          note: 'Standings endpoint is not mapped for OGOL yet. Match pages still expose league position and team stats for analysis.',
+        },
+      });
+    }
+    if (process.env.SCORES_PROVIDER === 'aiscore') {
+      return res.status(200).json({
+        status: 200,
+        data: createAiScoreStandingsPlaceholder(tournamentId, seasonId),
       });
     }
 

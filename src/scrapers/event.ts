@@ -1,5 +1,7 @@
 import { chromium, Browser } from 'playwright';
+import { fetchAiScoreEvent } from './aiscore';
 import { fetch365Event } from './scores365';
+import { fetchOgolEvent } from './ogol';
 import type { EventApiResponse, NormalizedEvent } from '../types/event';
 
 const SOFASCORE_BASE_URL = process.env.SOFASCORE_BASE_URL || 'https://www.sofascore.com/api/v1';
@@ -192,6 +194,12 @@ export async function fetchEvent(
 ): Promise<EventResponse> {
   if (process.env.SCORES_PROVIDER === '365scores') {
     return fetch365Event(eventId) as Promise<EventResponse>;
+  }
+  if (process.env.SCORES_PROVIDER === 'ogol') {
+    return fetchOgolEvent(eventId) as Promise<EventResponse>;
+  }
+  if (process.env.SCORES_PROVIDER === 'aiscore') {
+    return fetchAiScoreEvent(eventId) as Promise<EventResponse>;
   }
 
   const { retryOn403 = true } = options;

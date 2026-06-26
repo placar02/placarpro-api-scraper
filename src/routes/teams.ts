@@ -1,6 +1,8 @@
 import express from 'express';
 import { fetchTeamInfo } from '../scrapers/team-info';
+import { fetchAiScoreTeamInfo } from '../scrapers/aiscore';
 import { fetch365TeamInfo } from '../scrapers/scores365';
+import { fetchOgolTeamInfo } from '../scrapers/ogol';
 
 export const teamsRouter = express.Router();
 
@@ -185,7 +187,11 @@ teamsRouter.get('/:teamId', async (req, res) => {
   try {
     const teamData = process.env.SCORES_PROVIDER === '365scores'
       ? await fetch365TeamInfo(teamId)
-      : await fetchTeamInfo(teamId, { retryOn403 });
+      : process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolTeamInfo(teamId)
+      : process.env.SCORES_PROVIDER === 'aiscore'
+        ? await fetchAiScoreTeamInfo(teamId)
+        : await fetchTeamInfo(teamId, { retryOn403 });
 
     if (!teamData.data) {
       return res.status(404).json({ error: 'Team data not found' });

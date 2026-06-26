@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { envPath } from '../config/env';
 
 export const healthRouter = Router();
 
@@ -40,4 +41,13 @@ healthRouter.get('/', (req, res) => {
  */
 healthRouter.get('/health', (req, res) => {
   res.status(200).send('OK');
+});
+
+healthRouter.get('/health/provider', (req, res) => {
+  res.status(200).json({
+    ok: true,
+    provider: process.env.SCORES_PROVIDER || 'sofascore',
+    envPath,
+    cwd: process.cwd(),
+  });
 });

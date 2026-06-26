@@ -1,6 +1,6 @@
-import 'dotenv/config';
+import './config/env';
 
-console.log('ENV LOADED - SOFASCORE_BASE_URL present:', process.env.SOFASCORE_BASE_URL);
+console.log('ENV LOADED - SCORES_PROVIDER:', process.env.SCORES_PROVIDER);
 
 import express from 'express';
 import swaggerUi from 'swagger-ui-express';

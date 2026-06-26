@@ -14,19 +14,20 @@
     "nodemon": "^3.1.10",
     "path": "^0.12.7",
     "playwright": "^1.56.0",
+    "protobufjs": "^8.6.4",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
     "tsx": "^4.20.6"
   },
   "type": "module",
   "scripts": {
-  "start": "tsx src/index.ts",
-  "build": "node -e \"console.log('No build step required for scraper')\"",
-  "postinstall": "playwright install chromium",
-  "dev": "nodemon --exec tsx src/index.ts",
-  "test": "vitest run",
-  "test:routes": "vitest run tests/routes.chain.test.ts --reporter=verbose"
-},
+    "start": "tsx src/index.ts",
+    "build": "node -e \"console.log('No build step required for scraper')\"",
+    "postinstall": "playwright install chromium",
+    "dev": "nodemon --exec tsx src/index.ts",
+    "test": "vitest run",
+    "test:routes": "vitest run tests/routes.chain.test.ts --reporter=verbose"
+  },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",

@@ -1,7 +1,10 @@
 import { fetchEvent, SofaScoreBlockedError } from '../scrapers/event';
+import { fetchAiScoreIncidents, fetchAiScoreLineups, fetchAiScoreOdds, fetchAiScoreStatistics, fetchAiScoreStreaks } from '../scrapers/aiscore';
 import { fetchIncidents } from '../scrapers/incidents';
 import { fetchLineups } from '../scrapers/lineups';
 import { fetchOdds } from '../scrapers/odds';
+import { fetchOgolIncidents, fetchOgolLineups, fetchOgolOdds, fetchOgolStatistics, fetchOgolStreaks } from '../scrapers/ogol';
+import { fetch365Enrichment } from '../scrapers/scores365-enrichment';
 import { fetchStatistics } from '../scrapers/statistics';
 import { fetchStreaks } from '../scrapers/streaks';
 import { fetchTopPlayers } from '../scrapers/top-players';
@@ -17,6 +20,9 @@ interface LLMAnalysisInput {
   topPlayers?: any;
   refereeProfile?: any;
   playerProps?: any;
+  scores365?: any;
+  teamForm?: any;
+  dataQuality?: any;
 }
 
 interface LLMAnalysisResponse {
@@ -212,6 +218,7 @@ function summarizeStatistics(statisticsResp: any) {
     players,
     shotChart,
     summary: statisticsResp.summary,
+    context: statisticsResp.context || statisticsResp.raw?.context,
   };
 }
 
@@ -240,6 +247,12 @@ function summarizeLineups(lineupsResp: any) {
       shirtNumber: item.shirtNumber,
       rating: item.avgRating,
       captain: item.captain,
+      age: item.age,
+      height: item.height,
+      marketValue: item.marketValue,
+      intMarketValue: item.intMarketValue,
+      detailedPositions: item.detailedPositions,
+      hasStats: item.hasStats,
       stats: item.stats,
   });
   const summarizeSide = (side: any) => {
@@ -248,15 +261,20 @@ function summarizeLineups(lineupsResp: any) {
     const keyStarters = [...starters]
       .filter((player: any) => Number.isFinite(Number(player.avgRating)))
       .sort((a: any, b: any) => Number(b.avgRating) - Number(a.avgRating));
+    const keyByMarketValue = [...starters]
+      .filter((player: any) => Number.isFinite(Number(player.intMarketValue)))
+      .sort((a: any, b: any) => Number(b.intMarketValue) - Number(a.intMarketValue));
 
     return {
       formation: side?.formation,
+      squadSummary: side?.squadSummary,
       missingPlayers: limitArray(side?.missingPlayers, 8).map((item: any) => ({
         name: item.player?.name || item.name,
         reason: item.reason,
       })),
       starters: limitArray(starters, 11).map(summarizePlayer),
       keyStartersByRating: limitArray(keyStarters, 5).map(summarizePlayer),
+      keyPlayersByMarketValue: limitArray(keyByMarketValue, 6).map(summarizePlayer),
       bench: limitArray(bench, 5).map(summarizePlayer),
     };
   };
@@ -291,6 +309,211 @@ function summarizeTopPlayers(topPlayersResp: any) {
   };
 }
 
+function summarize365Enrichment(scores365Resp: any) {
+  if (!scores365Resp) return undefined;
+  if (!scores365Resp.available) {
+    return {
+      source: scores365Resp.source || '365scores-enrichment',
+      available: false,
+      reason: scores365Resp.reason,
+      matchSearch: scores365Resp.matchSearch,
+    };
+  }
+
+  return {
+    source: scores365Resp.source || '365scores-enrichment',
+    available: true,
+    scores365EventId: scores365Resp.scores365EventId,
+    matchSearch: scores365Resp.matchSearch,
+    matchedEvent: scores365Resp.matchedEvent,
+    dataCoverage: scores365Resp.dataCoverage,
+    odds: summarizeOdds(scores365Resp.odds),
+    statistics: summarizeStatistics(scores365Resp.statistics),
+    incidents: summarizeIncidents(scores365Resp.incidents),
+    lineups: summarizeLineups(scores365Resp.lineups),
+    streaks: summarizeStreaks(scores365Resp.streaks),
+    disciplineAndCorners: summarizeDisciplineAndCorners(scores365Resp.statistics, scores365Resp.incidents),
+    graph: scores365Resp.graph?.data ? {
+      periodTime: scores365Resp.graph.data.periodTime,
+      periodCount: scores365Resp.graph.data.periodCount,
+      summary: scores365Resp.graph.data.summary,
+      lastPoints: limitArray([...(scores365Resp.graph.data.points || [])].reverse(), 12),
+    } : undefined,
+  };
+}
+
+function normalizeText(value: unknown) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+function findStatItems(statisticsResp: any, patterns: RegExp[]) {
+  const groups = Object.values(statisticsResp?.by_period?.ALL?.groups_by_name || {});
+  const items = groups.flatMap((group: any) => Array.isArray(group.items) ? group.items : []);
+
+  return items
+    .filter((item: any) => {
+      const name = normalizeText(`${item.name || ''} ${item.key || ''}`);
+      return patterns.some((pattern) => pattern.test(name));
+    })
+    .map((item: any) => ({
+      name: item.name,
+      key: item.key,
+      home: item.home?.label ?? item.home?.value,
+      away: item.away?.label ?? item.away?.value,
+    }));
+}
+
+function summarizeDisciplineAndCorners(statisticsResp: any, incidentsResp: any) {
+  const incidents = incidentsResp?.data?.incidents || incidentsResp?.incidents || [];
+  const cards = Array.isArray(incidents)
+    ? incidents.filter((incident: any) => /card|yellow|red|cartao|cart/i.test(normalizeText(`${incident.type || ''} ${incident.class || ''} ${incident.incidentType || ''}`)))
+    : [];
+
+  return {
+    cornersFromStats: findStatItems(statisticsResp, [/corner|escanteio|corners/]),
+    cardsFromStats: findStatItems(statisticsResp, [/card|yellow|red|cartao|cartoes/]),
+    foulsFromStats: findStatItems(statisticsResp, [/foul|faltas|faul/]),
+    shotsFromStats: findStatItems(statisticsResp, [/shot|chute|finaliza|remate/]),
+    cardsFromIncidents: limitArray(cards, 12).map((incident: any) => ({
+      time: incident.time,
+      type: incident.type || incident.incidentType,
+      class: incident.class || incident.incidentClass,
+      isHome: incident.isHome,
+      player: incident.player?.name || incident.playerName,
+    })),
+    hasCardsData: Boolean(cards.length || findStatItems(statisticsResp, [/card|yellow|red|cartao|cartoes/]).length),
+    hasCornersData: Boolean(findStatItems(statisticsResp, [/corner|escanteio|corners/]).length),
+  };
+}
+
+function summarizeMatchForm(matches: any[], side: 'home' | 'away') {
+  const finished = limitArray(matches, 10)
+    .map((match: any) => {
+      const isHomeSide = side === 'home';
+      const forScore = Number(isHomeSide ? match.homeScore ?? match.homeScores?.[0] : match.awayScore ?? match.awayScores?.[0]);
+      const againstScore = Number(isHomeSide ? match.awayScore ?? match.awayScores?.[0] : match.homeScore ?? match.homeScores?.[0]);
+      if (!Number.isFinite(forScore) || !Number.isFinite(againstScore)) return null;
+
+      return {
+        id: match.id,
+        timestamp: match.matchTime,
+        opponent: isHomeSide ? match.awayTeam?.name || match.awayTeam?.id : match.homeTeam?.name || match.homeTeam?.id,
+        homeTeam: match.homeTeam?.name || match.homeTeam?.id,
+        awayTeam: match.awayTeam?.name || match.awayTeam?.id,
+        score: `${forScore}-${againstScore}`,
+        goalsFor: forScore,
+        goalsAgainst: againstScore,
+        result: forScore > againstScore ? 'W' : forScore === againstScore ? 'D' : 'L',
+        btts: forScore > 0 && againstScore > 0,
+        over25: forScore + againstScore > 2.5,
+        cleanSheet: againstScore === 0,
+        failedToScore: forScore === 0,
+        leaguePosition: isHomeSide ? match.ext?.homePosition : match.ext?.awayPosition,
+      };
+    })
+    .filter(Boolean) as any[];
+
+  const played = finished.length;
+  const totals = finished.reduce((acc, match) => {
+    acc.wins += match.result === 'W' ? 1 : 0;
+    acc.draws += match.result === 'D' ? 1 : 0;
+    acc.losses += match.result === 'L' ? 1 : 0;
+    acc.goalsFor += match.goalsFor;
+    acc.goalsAgainst += match.goalsAgainst;
+    acc.btts += match.btts ? 1 : 0;
+    acc.over25 += match.over25 ? 1 : 0;
+    acc.cleanSheets += match.cleanSheet ? 1 : 0;
+    acc.failedToScore += match.failedToScore ? 1 : 0;
+    return acc;
+  }, { wins: 0, draws: 0, losses: 0, goalsFor: 0, goalsAgainst: 0, btts: 0, over25: 0, cleanSheets: 0, failedToScore: 0 });
+
+  return {
+    played,
+    record: `${totals.wins}W-${totals.draws}D-${totals.losses}L`,
+    avgGoalsFor: played ? Number((totals.goalsFor / played).toFixed(2)) : undefined,
+    avgGoalsAgainst: played ? Number((totals.goalsAgainst / played).toFixed(2)) : undefined,
+    bttsRate: played ? Number(((totals.btts / played) * 100).toFixed(0)) : undefined,
+    over25Rate: played ? Number(((totals.over25 / played) * 100).toFixed(0)) : undefined,
+    cleanSheetRate: played ? Number(((totals.cleanSheets / played) * 100).toFixed(0)) : undefined,
+    failedToScoreRate: played ? Number(((totals.failedToScore / played) * 100).toFixed(0)) : undefined,
+    latestLeaguePosition: finished.find((match) => match.leaguePosition)?.leaguePosition,
+    recentMatches: finished,
+  };
+}
+
+function buildTeamFormSummary(streaksResp: any, statisticsResp: any, incidentsResp: any) {
+  const data = streaksResp?.data || streaksResp;
+  if (!data) return {
+    disciplineAndCorners: summarizeDisciplineAndCorners(statisticsResp, incidentsResp),
+  };
+
+  return {
+    homeRecent: summarizeMatchForm(data.home || [], 'home'),
+    awayRecent: summarizeMatchForm(data.away || [], 'away'),
+    headToHead: summarizeMatchForm(data.head2head || [], 'home'),
+    homeFuture: limitArray(data.homeFuture, 5),
+    awayFuture: limitArray(data.awayFuture, 5),
+    teams: limitArray(data.teams, 8),
+    competitions: limitArray(data.competitions, 8),
+    disciplineAndCorners: summarizeDisciplineAndCorners(statisticsResp, incidentsResp),
+  };
+}
+
+function hasPlayerData(input: LLMAnalysisInput) {
+  return Boolean(
+    input.statistics?.players?.length
+    || input.statistics?.shotChart?.length
+    || input.topPlayers?.home?.length
+    || input.topPlayers?.away?.length
+    || input.playerProps?.props?.length
+    || input.lineups?.home?.starters?.length
+    || input.lineups?.away?.starters?.length
+    || input.lineups?.home?.keyPlayersByMarketValue?.length
+    || input.lineups?.away?.keyPlayersByMarketValue?.length
+  );
+}
+
+function normalizeGeneratedAnalysis(parsed: any, input: LLMAnalysisInput) {
+  const normalized = { ...parsed };
+  const quality = input.dataQuality || {};
+  const marketBreakdown = {
+    ...(normalized.marketBreakdown || {}),
+  };
+
+  if (!quality.hasCardsData) {
+    marketBreakdown.cards = 'sem dados';
+  }
+  if (!quality.hasCornersData) {
+    marketBreakdown.corners = 'sem dados';
+  }
+  if (!hasPlayerData(input)) {
+    marketBreakdown.playerProps = 'sem dados';
+    normalized.playerAnalysis = {
+      ...(normalized.playerAnalysis || {}),
+      available: false,
+      mainPlayers: [],
+      unsupportedPlayerMarkets: ['sem dados'],
+    };
+  }
+
+  const referee = input.event?.referee;
+  const refereeName = normalizeText(referee?.name);
+  if (!referee || !referee?.id || refereeName === 'unknown' || refereeName === 'desconhecido') {
+    normalized.refereeAnalysis = {
+      available: false,
+      summary: 'sem dados',
+      cardsTrend: 'sem dados',
+      bettingImpact: 'sem dados',
+    };
+  }
+
+  normalized.marketBreakdown = marketBreakdown;
+  return normalized;
+}
+
 function buildRefereeProfile(event: any) {
   const referee = event?.referee;
   if (!referee || !referee.id) return undefined;
@@ -320,10 +543,32 @@ function buildRefereeProfile(event: any) {
 function summarizeStreaks(streaksResp: any) {
   const data = streaksResp?.data || streaksResp;
   if (!data) return undefined;
+  const teams = new Map((data.teams || []).map((team: any) => [String(team.id), team]));
+  const getTeamName = (team: any) => {
+    const full = teams.get(String(team?.id)) as any;
+    return full?.name || team?.name || team?.id;
+  };
+  const summarizeMatch = (match: any) => ({
+    id: match.id,
+    timestamp: match.matchTime,
+    statusId: match.statusId,
+    homeTeam: getTeamName(match.homeTeam),
+    awayTeam: getTeamName(match.awayTeam),
+    homeScore: match.homeScore ?? match.homeScores?.[0],
+    awayScore: match.awayScore ?? match.awayScores?.[0],
+    round: match.roundNum,
+    neutral: match.neutral,
+    homePosition: match.ext?.homePosition,
+    awayPosition: match.ext?.awayPosition,
+  });
 
   return {
     general: limitArray(data.general, 12),
-    head2head: limitArray(data.head2head, 12),
+    head2head: limitArray(data.head2head, 12).map(summarizeMatch),
+    homeRecent: limitArray(data.home, 8).map(summarizeMatch),
+    awayRecent: limitArray(data.away, 8).map(summarizeMatch),
+    homeFuture: limitArray(data.homeFuture, 5).map(summarizeMatch),
+    awayFuture: limitArray(data.awayFuture, 5).map(summarizeMatch),
   };
 }
 
@@ -444,8 +689,12 @@ function summarize365PlayerProps(game: any) {
   };
 }
 
-function build365LLMInput(raw: any, normalizedEvent: any, statisticsResp: any, incidentsResp: any, lineupsResp: any, streaksResp: any): LLMAnalysisInput {
+function build365LLMInput(raw: any, normalizedEvent: any, statisticsResp: any, incidentsResp: any, lineupsResp: any, streaksResp: any, scores365Resp?: any): LLMAnalysisInput {
   const game = raw.game || {};
+  const teamForm = buildTeamFormSummary(streaksResp, statisticsResp, incidentsResp);
+  const scores365 = summarize365Enrichment(scores365Resp);
+  const scores365Discipline = scores365?.disciplineAndCorners;
+  const ownDiscipline = teamForm.disciplineAndCorners;
 
   return {
     event: {
@@ -475,30 +724,49 @@ function build365LLMInput(raw: any, normalizedEvent: any, statisticsResp: any, i
     topPerformers: summarize365TopPerformers(game),
     refereeProfile: buildRefereeProfile(normalizedEvent),
     playerProps: summarize365PlayerProps(game),
+    scores365,
+    teamForm,
+    dataQuality: {
+      has365Scores: Boolean(scores365?.available),
+      hasCardsData: Boolean(ownDiscipline?.hasCardsData || scores365Discipline?.hasCardsData),
+      hasCornersData: Boolean(ownDiscipline?.hasCornersData || scores365Discipline?.hasCornersData),
+    },
   } as LLMAnalysisInput;
 }
 
-function buildLLMInput(event: any, oddsResp: any, statisticsResp: any, incidentsResp: any, lineupsResp: any, streaksResp: any, topPlayersResp?: any): LLMAnalysisInput {
+function buildLLMInput(event: any, oddsResp: any, statisticsResp: any, incidentsResp: any, lineupsResp: any, streaksResp: any, topPlayersResp?: any, scores365Resp?: any): LLMAnalysisInput {
   if (event?.raw?.game && event?.data) {
-    return build365LLMInput(event.raw, event.data, statisticsResp, incidentsResp, lineupsResp, streaksResp);
+    return build365LLMInput(event.raw, event.data, statisticsResp, incidentsResp, lineupsResp, streaksResp, scores365Resp);
   }
 
   const sourceEvent = event?.raw?.event || event?.data || event;
   const normalizedEvent = sourceEvent.event || sourceEvent;
+  const source = process.env.SCORES_PROVIDER || 'sofascore';
+  const teamForm = buildTeamFormSummary(streaksResp, statisticsResp, incidentsResp);
+  const scores365 = summarize365Enrichment(scores365Resp);
+  const ownDiscipline = teamForm.disciplineAndCorners;
+  const scores365Discipline = scores365?.disciplineAndCorners;
 
   return {
     event: {
       id: normalizedEvent.id,
       slug: normalizedEvent.slug,
+      source,
       tournament: normalizedEvent.tournament,
       season: normalizedEvent.season,
-      roundInfo: normalizedEvent.roundInfo,
+      roundInfo: normalizedEvent.roundInfo || (normalizedEvent.round ? { round: normalizedEvent.round } : undefined),
       status: normalizedEvent.status,
-      startTimestamp: normalizedEvent.startTimestamp,
+      startTimestamp: normalizedEvent.startTimestamp ?? normalizedEvent.startTime,
       homeTeam: normalizedEvent.homeTeam,
       awayTeam: normalizedEvent.awayTeam,
-      homeScore: normalizedEvent.homeScore,
-      awayScore: normalizedEvent.awayScore,
+      homeScore: normalizedEvent.homeScore || (normalizedEvent.score ? {
+        current: normalizedEvent.score.home,
+        display: normalizedEvent.score.homeDisplay,
+      } : undefined),
+      awayScore: normalizedEvent.awayScore || (normalizedEvent.score ? {
+        current: normalizedEvent.score.away,
+        display: normalizedEvent.score.awayDisplay,
+      } : undefined),
       venue: normalizedEvent.venue,
       referee: normalizedEvent.referee,
     },
@@ -509,6 +777,16 @@ function buildLLMInput(event: any, oddsResp: any, statisticsResp: any, incidents
     streaks: summarizeStreaks(streaksResp),
     topPlayers: summarizeTopPlayers(topPlayersResp),
     refereeProfile: buildRefereeProfile(normalizedEvent),
+    scores365,
+    teamForm,
+    dataQuality: {
+      has365Scores: Boolean(scores365?.available),
+      hasAiScoreHistory: Boolean((streaksResp?.data || streaksResp)?.home?.length || (streaksResp?.data || streaksResp)?.away?.length),
+      hasAiScoreLineupPool: Boolean((lineupsResp?.data || lineupsResp)?.home?.players?.length || (lineupsResp?.data || lineupsResp)?.away?.players?.length),
+      hasAiScoreStats: Boolean(statisticsResp?.summary?.total_items),
+      hasCardsData: Boolean(ownDiscipline?.hasCardsData || scores365Discipline?.hasCardsData),
+      hasCornersData: Boolean(ownDiscipline?.hasCornersData || scores365Discipline?.hasCornersData),
+    },
   };
 }
 
@@ -599,6 +877,8 @@ async function callLLMAnalysis(input: LLMAnalysisInput): Promise<LLMAnalysisResp
   const apiKey = process.env.AZURE_OPENAI_API_KEY;
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
   const deploymentName = process.env.AZURE_OPENAI_DEPLOYMENT_NAME;
+  const timeoutMs = Number(process.env.AZURE_OPENAI_TIMEOUT_MS || 45000);
+  const maxTokens = Number(process.env.AZURE_OPENAI_MAX_TOKENS || 2200);
   const eventData = input.event;
 
   if (!apiKey || !endpoint || !deploymentName) {
@@ -616,23 +896,36 @@ Analise os dados da partida em profundidade. Compare mandante e visitante usando
 Use o perfil do arbitro para mercados de cartoes quando houver dados de jogos, amarelos, vermelhos ou cartoes por jogo.
 Use escalacoes, top players, posicoes, ratings e estatisticas de finalizacao/chances para avaliar mercados de jogador, como chute no gol, finalizacao, gol ou assistencia.
 Na fonte 365scores, considere que ha dados de jogador se existir qualquer um destes blocos: statistics.players, statistics.shotChart, topPerformers ou playerProps. Nao marque playerAnalysis.available como false quando esses blocos existirem.
+Na fonte aiscore, use event.source="aiscore" no dataCoverage.source. Considere que partidas pre-match podem nao ter estatisticas, escalações ou incidentes ainda; nesse caso, use os dados confirmados de evento, times, competição, local, status e arbitro para uma leitura conservadora, sem inventar forma recente.
+Na fonte ogol, use event.source="ogol" no dataCoverage.source. O OGOL vem de HTML publico e pode trazer agenda, status ao vivo, minuto, placar, odds 1x2, ultimos titulares, desfalques, estatisticas da competicao, fatos da temporada, confronto direto, estadio e arbitro. Use esses campos quando existirem e escreva "sem dados" para incidentes minuto a minuto, xG, heatmap ou props de jogador quando ausentes.
+Na fonte ogol, priorize statistics.context quando existir. Use competitionTable e teamNeeds para explicar situacao no campeonato/grupo, posicao, pontos, saldo aproximado por gols pro/contra e se o time precisa vencer. Use seasonFacts para forma, aproveitamento, gols marcados/sofridos e tendencias de marcar/sofrer. Use teamPeriods para comparar pontos, posicao, gols, gols esperados, chutes, escanteios, amarelos/vermelhos quando existirem. Use referee.name e referee.cardsAverage quando existir; se cardsAverage estiver ausente, diga que o arbitro foi identificado mas sem media publica no OGOL, e nao invente media. Para mercados de cartoes e faltas, so recomende se houver dado disciplinar real de arbitro, amarelos, vermelhos, faltas ou perfil de times faltosos. Para escanteios, use escanteios por jogo e volume de chutes. Para gols, use media de gols, gols esperados, gols marcados/sofridos e forma recente.
+Na fonte ogol, quando event.status.type="inprogress", o minuto/status e o placar atual sao dados concretos. Se nao houver estatisticas profundas, ainda assim faca uma leitura tecnica conservadora de mercados ao vivo sustentados pelo estado do jogo, como under/over de linha alta, proximo gol com cautela, dupla chance live ou aguardar entrada. Cite obrigatoriamente o minuto e o placar na justificativa. Nao use odds para decidir.
+Na fonte ogol, se event.status.type="inprogress" e houver placar atual, voce deve retornar pelo menos uma recommendation com confidence maior que 0 baseada somente no minuto e placar. Para jogo ao vivo com 0-0 antes do intervalo, prefira mercado conservador de gols como "under 3.5 gols ao vivo" ou "under 2.5 gols ao vivo" conforme a cautela dos dados. Nao retorne "sem entrada confiavel" nesse caso; use warningSigns para explicar os dados ausentes.
+Quando scores365.available=true, use scores365 como fonte complementar para estatisticas, odds reais, escanteios quando houver, cartoes, lineups, incidentes, streaks, placar/status e dados ao vivo. Cite scores365.scores365EventId e os campos concretos usados quando eles ajudarem a justificar a entrada.
+Se 365Scores nao encontrar correspondencia confiavel ou algum endpoint publico nao retornar dados, diga isso em dataCoverage.missingData, mas continue usando AiScore e os demais dados disponiveis.
+Use apenas os campos retornados em scores365.statistics, scores365.incidents, scores365.lineups, scores365.streaks e scores365.odds. Se um bloco estiver ausente, nao invente; escreva "sem dados" para o mercado afetado.
+Na fonte aiscore, use obrigatoriamente teamForm.homeRecent, teamForm.awayRecent, teamForm.headToHead, teamForm.disciplineAndCorners e lineups antes de dizer que faltam dados. Esses blocos resumem ultimas partidas, gols pro/contra, BTTS, over 2.5, clean sheets, posicao recente no campeonato, elenco, desfalques e estatisticas de jogo quando disponiveis.
+Para cartoes e escanteios, primeiro procure em teamForm.disciplineAndCorners.cardsFromStats, cardsFromIncidents, cornersFromStats, foulsFromStats e statistics.teamPeriods. Se existir qualquer valor concreto, faca uma leitura tecnica com cautela. So diga que nao ha dado concreto quando esses campos tambem estiverem vazios.
+Nao coloque "cartoes" ou "escanteios" em avoidMarkets apenas porque uma fonte secundaria nao retornou dados; se AiScore ou 365Scores tiver stats/incidentes ou historico suficiente, use esses dados. Se realmente nao houver dado numerico, diga a limitacao dentro de marketBreakdown sem transformar isso em entrada principal.
 So recomende mercado de jogador quando existir suporte nos dados esportivos enviados. Se houver playerProps/topPerformers/statistics.players, use esses dados para explicar gol, finalizacao ou chute no gol; se faltar estatistica individual de finalizacao, diga a incerteza e prefira mercados de time.
 Na fonte 365scores, o arbitro pode vir em event.referee vindo de officials. Se houver nome do arbitro mas sem media historica de cartoes, marque refereeAnalysis.available como true, informe que o arbitro foi identificado, e classifique cardsTrend como "historico indisponivel" em vez de "indisponivel". Use estatisticas de cartoes do jogo quando existirem.
 Considere tambem mercados de gols, ambas marcam, vencedor, dupla chance, handicap, escanteios, cartoes e entradas ao vivo quando os dados sustentarem.
 Nao escolha entradas por cotacao, odd baixa, odd favorita, voto popular, predicao de mercado ou probabilidade implicita de mercado. A recomendacao deve nascer somente da leitura tecnica da partida.
 Se algum dado de odd, cotacao, relatedLines, prediction ou mercado aparecer acidentalmente nos dados, ignore completamente para a decisao e para a justificativa.
 Se algum bloco de dados estiver ausente, explique a incerteza sem inventar fatos.
+Nunca invente numeros, tendencias, arbitro, cartoes, escanteios, chutes ou dados de jogador. Tente usar todos os dados reais enviados primeiro; se depois disso nao houver dado concreto para um mercado, escreva exatamente "sem dados" naquele campo do marketBreakdown ou da analise correspondente.
 Se a partida for pre-match, diferencie leitura provavel de fato confirmado.
 Evite frases genericas. Cite os dados concretos recebidos: status, local, top performers, escalacoes, estatisticas, desfalques, shot chart, incidentes e perfil de arbitro.
 Retorne APENAS um JSON valido neste formato:
 {
   "dataCoverage": {
-    "source": "365scores ou sofascore",
+    "source": "aiscore, 365scores, ogol ou sofascore",
     "hasLineups": true,
     "hasTopPerformers": true,
     "hasPlayerProps": true,
     "hasShotChart": true,
     "hasStatistics": true,
+    "has365Scores": true,
     "hasReferee": true,
     "missingData": ["dados ausentes que limitam a analise"]
   },
@@ -720,11 +1013,13 @@ Inclua entre 5 e 8 recomendacoes quando houver dados suficientes, cubra categori
         { role: 'user', content: `${prompt}\n\nDados:\n${JSON.stringify(input)}` }
       ],
       temperature: 0.2,
-      max_tokens: 3200,
+      max_tokens: maxTokens,
     };
 
     const url = `${normalizeAzureEndpoint(endpoint)}openai/deployments/${deploymentName}/chat/completions?api-version=2024-02-15-preview`;
     console.log('Calling Azure OpenAI at:', url);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     const res = await fetch(url, {
       method: 'POST',
@@ -733,7 +1028,8 @@ Inclua entre 5 e 8 recomendacoes quando houver dados suficientes, cubra categori
         'api-key': apiKey,
       },
       body: JSON.stringify(requestBody),
-    });
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeout));
 
     console.log('Azure OpenAI response status:', res.status);
 
@@ -752,7 +1048,7 @@ Inclua entre 5 e 8 recomendacoes quando houver dados suficientes, cubra categori
     }
 
     console.log('Azure OpenAI raw response:', content);
-    const parsed = extractJsonObject(content) as any;
+    const parsed = normalizeGeneratedAnalysis(extractJsonObject(content) as any, input);
     const recommendations: BettingRecommendation[] = [];
 
     if (Array.isArray(parsed.recommendations)) {
@@ -778,7 +1074,10 @@ Inclua entre 5 e 8 recomendacoes quando houver dados suficientes, cubra categori
 
     const result = selectBestRecommendation(recommendations, eventData?.id ?? 'unknown', 'azure-openai');
     result.matchAnalysis = typeof parsed.matchAnalysis === 'string' ? parsed.matchAnalysis : undefined;
-    result.dataCoverage = parsed.dataCoverage;
+    result.dataCoverage = {
+      ...(parsed.dataCoverage || {}),
+      source: eventData?.source || parsed.dataCoverage?.source || process.env.SCORES_PROVIDER || 'unknown',
+    };
     result.keyFactors = Array.isArray(parsed.keyFactors) ? parsed.keyFactors : undefined;
     result.homeAnalysis = parsed.homeAnalysis;
     result.awayAnalysis = parsed.awayAnalysis;
@@ -829,6 +1128,53 @@ function buildOddsRecommendations(oddsResp: any): BettingRecommendation[] {
             marketPeriod: market.market_period,
             choiceGroup: market.choice_group,
             decimal_odds: choice.decimal_odds,
+          },
+        }));
+      }
+    }
+  }
+
+  return recommendations.sort((a, b) => b.confidence - a.confidence).slice(0, 5);
+}
+
+function buildMarketOddsRecommendations(oddsResp: any): BettingRecommendation[] {
+  const recommendations: BettingRecommendation[] = [];
+  const marketGroups = Object.values(oddsResp?.markets_by_group || {}) as any[];
+
+  for (const group of marketGroups) {
+    for (const market of group.markets || []) {
+      const choices = Array.isArray(market.choices) ? market.choices : [];
+      const validChoices = choices
+        .map((choice: any) => ({ ...choice, decimal_odds: Number(choice.decimal_odds || 0) }))
+        .filter((choice: any) => Number.isFinite(choice.decimal_odds) && choice.decimal_odds > 1)
+        .sort((a: any, b: any) => a.decimal_odds - b.decimal_odds);
+      if (!validChoices.length) continue;
+
+      const impliedTotal = validChoices.reduce((total: number, choice: any) => total + (1 / choice.decimal_odds), 0);
+
+      for (const [index, choice] of validChoices.slice(0, 3).entries()) {
+        const implied = 1 / choice.decimal_odds;
+        const normalizedImplied = impliedTotal > 0 ? implied / impliedTotal : implied;
+        const rankBoost = index === 0 ? 8 : index === 1 ? 3 : 0;
+        const confidence = Math.max(35, Math.min(78, Math.round(((normalizedImplied * 0.75) + (implied * 0.25)) * 100) + rankBoost));
+
+        recommendations.push(buildRecommendation({
+          market: market.market_name || market.market_group || 'odds-market',
+          recommendation: `${choice.name} @ ${choice.decimal_odds.toFixed(2)}`,
+          confidence,
+          rationale: `Entrada baseada nas odds reais do provider: ${choice.name} aparece como a ${index === 0 ? 'opcao mais provavel' : 'opcao alternativa'} com odd ${choice.decimal_odds.toFixed(2)}.`,
+          dataSupport: [
+            `odd ${choice.decimal_odds.toFixed(2)}`,
+            `probabilidade implicita normalizada ${Math.round(normalizedImplied * 100)}%`,
+            oddsResp?.source ? `fonte ${oddsResp.source}` : 'fonte odds',
+          ],
+          riskLevel: confidence >= 65 ? 'baixo' : confidence >= 52 ? 'medio' : 'alto',
+          meta: {
+            marketPeriod: market.market_period,
+            choiceGroup: market.choice_group,
+            decimal_odds: choice.decimal_odds,
+            impliedProbability: Number((implied * 100).toFixed(2)),
+            normalizedImpliedProbability: Number((normalizedImplied * 100).toFixed(2)),
           },
         }));
       }
@@ -906,11 +1252,23 @@ function buildHeuristicRecommendations(event: any): AnalysisResult {
   return selectBestRecommendation(recommendations, event.id ?? 'unknown', 'heuristic');
 }
 
+function isActionableAnalysis(result: AnalysisResult | null) {
+  if (!result) return false;
+  const recommendation = normalizeText(result.recommendation);
+  const market = normalizeText(result.market);
+  if (Number(result.confidence || 0) <= 0) return false;
+  if (['error', 'erro', 'none', 'nenhum'].includes(recommendation)) return false;
+  if (['error', 'erro', 'none', 'nenhum'].includes(market)) return false;
+  if (recommendation.includes('nenhuma entrada') || recommendation.includes('no recommendation')) return false;
+  return true;
+}
+
 export async function analyzeEvent(eventId: number | string, options: AnalyzeOptions = {}): Promise<AnalysisResult> {
   const {
     useLLM = true,
     includeOdds = false,
     useOddsFallback = false,
+    includeEnrichment = true,
   } = options;
   const eventResp = await fetchEvent(eventId).catch((err) => {
     if (err instanceof SofaScoreBlockedError) {
@@ -928,48 +1286,90 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
   });
 
   if (!eventResp || eventResp.status !== 200 || !eventResp.data) {
+    const providerReason = eventResp?.raw?.reason || eventResp?.raw?.matches?.error || eventResp?.raw?.message;
     return {
       eventId,
       market: 'none',
       recommendation: 'error',
       confidence: 0,
-      rationale: 'Não foi possível obter dados do evento',
+      rationale: providerReason
+        ? `Não foi possível obter dados do evento: ${providerReason}`
+        : 'Não foi possível obter dados do evento',
       meta: { raw: eventResp?.raw },
     } as AnalysisResult;
   }
 
   const event = eventResp.data;
   const is365ScoresProvider = process.env.SCORES_PROVIDER === '365scores';
-  const [oddsResp, statisticsResp, incidentsResp, lineupsResp, streaksResp, topPlayersResp] = await Promise.all([
-    !is365ScoresProvider && (includeOdds || useOddsFallback) ? safeFetch('odds', () => fetchOdds(eventId, 1)) : Promise.resolve(null),
-    !is365ScoresProvider ? safeFetch('statistics', () => fetchStatistics(eventId)) : Promise.resolve(null),
-    !is365ScoresProvider ? safeFetch('incidents', () => fetchIncidents(eventId)) : Promise.resolve(null),
-    !is365ScoresProvider ? safeFetch('lineups', () => fetchLineups(eventId)) : Promise.resolve(null),
-    !is365ScoresProvider ? safeFetch('streaks', () => fetchStreaks(String(eventId))) : Promise.resolve(null),
-    useLLM && !is365ScoresProvider ? fetchTopPlayersForEvent(event) : Promise.resolve(null),
+  const isAiScoreProvider = process.env.SCORES_PROVIDER === 'aiscore';
+  const isOgolProvider = process.env.SCORES_PROVIDER === 'ogol';
+  const shouldUseOdds = !is365ScoresProvider && (includeOdds || useOddsFallback);
+  const needsDeepData = useLLM;
+  const [oddsResp, statisticsResp, incidentsResp, lineupsResp, streaksResp, topPlayersResp, scores365Resp] = await Promise.all([
+    shouldUseOdds
+      ? safeFetch('odds', () => isAiScoreProvider ? fetchAiScoreOdds(eventId) : isOgolProvider ? fetchOgolOdds(eventId) : fetchOdds(eventId, 1))
+      : Promise.resolve(null),
+    needsDeepData && !is365ScoresProvider
+      ? safeFetch('statistics', () => isAiScoreProvider ? fetchAiScoreStatistics(eventId) : isOgolProvider ? fetchOgolStatistics(eventId) : fetchStatistics(eventId))
+      : Promise.resolve(null),
+    needsDeepData && !is365ScoresProvider
+      ? safeFetch('incidents', () => isAiScoreProvider ? fetchAiScoreIncidents(eventId) : isOgolProvider ? fetchOgolIncidents(eventId) : fetchIncidents(eventId))
+      : Promise.resolve(null),
+    needsDeepData && !is365ScoresProvider
+      ? safeFetch('lineups', () => isAiScoreProvider ? fetchAiScoreLineups(eventId) : isOgolProvider ? fetchOgolLineups(eventId) : fetchLineups(eventId))
+      : Promise.resolve(null),
+    needsDeepData && !is365ScoresProvider
+      ? safeFetch('streaks', () => isAiScoreProvider ? fetchAiScoreStreaks(String(eventId)) : isOgolProvider ? fetchOgolStreaks(String(eventId)) : fetchStreaks(String(eventId)))
+      : Promise.resolve(null),
+    useLLM && !is365ScoresProvider && !isAiScoreProvider && !isOgolProvider ? fetchTopPlayersForEvent(event) : Promise.resolve(null),
+    useLLM && includeEnrichment && !is365ScoresProvider && !isOgolProvider ? safeFetch('365Scores enrichment', () => fetch365Enrichment(event)) : Promise.resolve(null),
   ]);
   let llmError: string | undefined;
 
   if (useLLM) {
     const llmInput = buildLLMInput(
       { raw: eventResp.raw, data: eventResp.data },
-      includeOdds ? oddsResp : null,
+      shouldUseOdds ? oddsResp : null,
       statisticsResp,
       incidentsResp,
       lineupsResp,
       streaksResp,
-      topPlayersResp
+      topPlayersResp,
+      scores365Resp
     );
     const llmAnalysis = await callLLMAnalysis(llmInput);
-    if (llmAnalysis.result) return llmAnalysis.result;
-    llmError = llmAnalysis.error;
+    if (isActionableAnalysis(llmAnalysis.result)) return llmAnalysis.result as AnalysisResult;
+    llmError = llmAnalysis.error || (isOgolProvider
+      ? 'LLM returned no actionable recommendation from OGOL data.'
+      : 'LLM returned no actionable recommendation; using heuristic fallback.');
+    if (isOgolProvider) {
+      return {
+        eventId,
+        market: 'none',
+        recommendation: 'sem entrada confiavel',
+        confidence: 0,
+        rationale: 'A IA analisou os dados disponiveis do OGOL, mas nao encontrou base esportiva suficiente para recomendar uma entrada sem usar odds ou fallback heuristico.',
+        analysisSource: 'azure-openai',
+        meta: {
+          provider: 'ogol',
+          llmError,
+          noOddsFallback: true,
+          noHeuristicFallback: true,
+        },
+      };
+    }
   }
 
-  if (!useLLM && useOddsFallback && oddsResp && oddsResp.markets_by_group) {
+  if (useOddsFallback && oddsResp && oddsResp.markets_by_group) {
     const recommendations = buildOddsRecommendations(oddsResp);
     if (recommendations.length) {
       const result = selectBestRecommendation(recommendations, event.id ?? eventId, 'odds');
-      result.meta = { source: 'odds', rawOdds: oddsResp, eventId, llmError };
+      result.meta = {
+        source: 'odds',
+        rawOdds: oddsResp,
+        eventId,
+        llmError,
+      };
       return result;
     }
   }

@@ -2,7 +2,9 @@ import { Router } from 'express';
 import { fetchLiveMatches } from '../scrapers/live';
 import type { LiveMatchesResponse } from '../scrapers/live';
 import { fetchScheduledMatches } from '../scrapers/scheduled';
+import { fetchAiScoreMatches } from '../scrapers/aiscore';
 import { fetch365Matches } from '../scrapers/scores365';
+import { fetchOgolMatches } from '../scrapers/ogol';
 
 export const matchesRouter = Router();
 
@@ -71,7 +73,11 @@ matchesRouter.get('/live-matches', async (req, res) => {
   try {
     const result: LiveMatchesResponse = process.env.SCORES_PROVIDER === '365scores'
       ? await fetch365Matches()
-      : await fetchLiveMatches({ ifNoneMatch, retryOn403 });
+      : process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolMatches()
+      : process.env.SCORES_PROVIDER === 'aiscore'
+        ? await fetchAiScoreMatches()
+        : await fetchLiveMatches({ ifNoneMatch, retryOn403 });
 
     if (result.status === 304) {
       if (result.etag) res.setHeader('ETag', result.etag as string);
@@ -83,9 +89,12 @@ matchesRouter.get('/live-matches', async (req, res) => {
     }
 
     const payload = result.events ?? (result as any).raw ?? {};
+    const livePayload = process.env.SCORES_PROVIDER === 'aiscore' && Array.isArray(payload)
+      ? payload.filter((event: any) => ['inprogress', 'live'].includes(String(event.status?.type || '').toLowerCase()))
+      : payload;
 
     // Add image URLs to each event
-    const eventsWithImages = Array.isArray(payload) ? payload.map((event: any) => ({
+    const eventsWithImages = Array.isArray(livePayload) ? livePayload.map((event: any) => ({
       ...event,
       homeTeam: {
         ...event.homeTeam,
@@ -95,7 +104,7 @@ matchesRouter.get('/live-matches', async (req, res) => {
         ...event.awayTeam,
         imageUrl: `/team/${event.awayTeam.id}/image`
       }
-    })) : payload;
+    })) : livePayload;
 
     return res.status(200).json({ status: result.status ?? 200, data: eventsWithImages });
   } catch (err: unknown) {
@@ -114,8 +123,12 @@ matchesRouter.get('/scheduled-matches', async (req, res) => {
   try {
     const result = process.env.SCORES_PROVIDER === '365scores'
       ? await fetch365Matches(date)
-      : await fetchScheduledMatches(date, retryOn403);
-    return res.status(200).json({ status: result.status ?? 200, data: result.events || [] });
+      : process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolMatches(date)
+      : process.env.SCORES_PROVIDER === 'aiscore'
+        ? await fetchAiScoreMatches(date)
+        : await fetchScheduledMatches(date, retryOn403);
+    return res.status(result.status ?? 200).json({ status: result.status ?? 200, data: result.events || [], raw: (result as any).raw });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     console.error('Error in /scheduled-matches:', err);

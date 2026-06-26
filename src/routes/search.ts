@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { fetchSearch } from '../scrapers/search';
 import { fetch365SearchTeams } from '../scrapers/scores365';
+import { fetchOgolSearchTeams } from '../scrapers/ogol';
 
 export const searchRouter = Router();
 
@@ -74,6 +75,8 @@ searchRouter.get('/search/teams', async (req, res) => {
   try {
     const searchData = process.env.SCORES_PROVIDER === '365scores'
       ? await fetch365SearchTeams(q, pageNum)
+      : process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolSearchTeams(q, pageNum)
       : await fetchSearch(q, pageNum, { retryOn403 });
 
     if (!searchData.data) {
