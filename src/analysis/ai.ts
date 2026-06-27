@@ -253,6 +253,7 @@ function summarizeLineups(lineupsResp: any) {
       intMarketValue: item.intMarketValue,
       detailedPositions: item.detailedPositions,
       hasStats: item.hasStats,
+      profileText: item.profileText,
       stats: item.stats,
   });
   const summarizeSide = (side: any) => {

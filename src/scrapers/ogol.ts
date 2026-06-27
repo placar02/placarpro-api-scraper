@@ -37,11 +37,25 @@ type OgolEventDetails = {
   text: string;
   sections: Record<string, string>;
   anchors: Array<{ text: string; href: string }>;
+  entities?: {
+    players: OgolEntityLink[];
+    referees: OgolEntityLink[];
+  };
   context?: Record<string, unknown>;
+};
+
+type OgolEntityLink = {
+  name: string;
+  href: string;
+  context: string;
+  contexts?: string[];
+  sectionTitle?: string;
+  sideHint?: 'home' | 'away';
 };
 
 const matchCache = new Map<string, { expiresAt: number; promise: Promise<{ status: number; events: EventLive[]; raw: any }> }>();
 const detailsCache = new Map<string, { expiresAt: number; promise: Promise<OgolEventDetails | null> }>();
+const refereeProfileCache = new Map<string, { expiresAt: number; promise: Promise<Record<string, unknown>> }>();
 
 async function readDiskCache() {
   try {
@@ -108,6 +122,19 @@ function toNumber(value: unknown) {
 function parseEventIdFromUrl(url: string) {
   const match = String(url).match(/\/(\d+)(?:[/?#]|$)/);
   return match ? Number(match[1]) : 0;
+}
+
+function parseEntityIdFromUrl(url: string) {
+  const ids = String(url).match(/\d+/g);
+  return ids?.length ? Number(ids.at(-1)) : 0;
+}
+
+function cleanEntityName(value: string) {
+  const lines = linesFrom(value).filter((line) =>
+    !/^\d+$/.test(line)
+    && !/^(jogador|arbitro|árbitro|perfil|ver mais)$/i.test(line)
+  );
+  return lines[0] || String(value || '').replace(/\s+/g, ' ').trim();
 }
 
 function absoluteUrl(href: string) {
@@ -275,6 +302,10 @@ function toNormalizedEvent(details: OgolEventDetails): NormalizedEvent {
       id: teamId(referee),
       name: referee,
       slug: toSlug(referee),
+      games: context?.referee?.games,
+      yellowCards: context?.referee?.yellowCards,
+      redCards: context?.referee?.redCards,
+      country: context?.referee?.country,
     },
     startTime: live.startTimestamp,
     currentTime: live.time.currentPeriodStartTimestamp,
@@ -322,6 +353,10 @@ async function loadPageText(page: Page, url: string) {
     throw new Error(`OGOL HTTP ${response?.status() || 'no-response'} for ${url}`);
   }
   await page.waitForTimeout(500);
+  const bodyText = await page.locator('body').innerText().catch(() => '');
+  if (/sorry, you have been blocked|unable to access ogol/i.test(bodyText)) {
+    throw new Error(`OGOL blocked the automated request for ${url}`);
+  }
 }
 
 function buildAgendaUrls(date?: string) {
@@ -360,6 +395,11 @@ function parseTeamsFromDetails(title?: string, h1Text?: string) {
   const h1Vs = h1.match(/^(.+?)\s*\n\s*vs\s*\n\s*(.+)$/i) || h1.match(/^(.+?)\s+vs\s+(.+)$/i);
   if (h1Vs) return { homeTeam: h1Vs[1].trim(), awayTeam: h1Vs[2].trim() };
 
+  const h1Score = h1.replace(/\n+/g, ' ').match(/^(.+?)\s+\d+\s*[-x]\s*\d+\s+(.+)$/i);
+  if (h1Score) return { homeTeam: h1Score[1].trim(), awayTeam: h1Score[2].trim() };
+
+  const titleScore = String(title || '').match(/^(.+?)\s+\d+\s*[x-]\s*\d+\s+(.+?)\s+::/i);
+  if (titleScore) return { homeTeam: titleScore[1].trim(), awayTeam: titleScore[2].trim() };
   const titleMatch = String(title || '').match(/^(.+?)\s+x\s+(.+?)\s+::/i);
   if (titleMatch) return { homeTeam: titleMatch[1].trim(), awayTeam: titleMatch[2].trim() };
 
@@ -569,6 +609,75 @@ function parseRefereeContext(text: string, sections: Record<string, string>, anc
   };
 }
 
+function profileNumber(text: string, labels: string[]) {
+  for (const label of labels) {
+    const escaped = escapeRegExp(label);
+    const after = text.match(new RegExp(`${escaped}\\s*[:\\-]?\\s*(\\d+)`, 'i'))?.[1];
+    const before = text.match(new RegExp(`(\\d+)\\s+${escaped}`, 'i'))?.[1];
+    const value = toNumber(after || before);
+    if (value > 0) return value;
+  }
+  return undefined;
+}
+
+function parseRefereeProfile(text: string, title: string) {
+  const lines = linesFrom(text);
+  const personalStart = lines.findIndex((line) => /^DADOS PESSOAIS$/i.test(line));
+  const personalEnd = lines.findIndex((line, index) => index > personalStart && /^PR[ÓO]XIMOS JOGOS$/i.test(line));
+  const personalLines = personalStart >= 0 ? lines.slice(personalStart, personalEnd > personalStart ? personalEnd : personalStart + 50) : [];
+  const historyStart = lines.findIndex((line) => /^HIST[ÓO]RICO COMO [ÁA]RBITRO$/i.test(line));
+  const historyEnd = lines.findIndex((line, index) => index > historyStart && /^COLABORA[CÇ][ÃA]O$/i.test(line));
+  const historyLines = historyStart >= 0 ? lines.slice(historyStart, historyEnd > historyStart ? historyEnd : historyStart + 120) : [];
+  const history = historyLines.join(' ');
+  const games = profileNumber(history, ['Jogos arbitrados', 'Jogos dirigidos']);
+  const yellowCards = profileNumber(history, ['Cartões amarelos']);
+  const redCards = profileNumber(history, ['Cartões vermelhos']);
+  const nationalityIndex = personalLines.findIndex((line) => /^NACIONALIDADE/i.test(line));
+  const country = nationalityIndex >= 0 ? personalLines[nationalityIndex + 1] : undefined;
+  const explicitAverage = history.match(/M[eé]dia\s+(?:de\s+)?cart[oõ]es\s*[:\-]?\s*([\d.,]+)/i)?.[1];
+  const totalCards = Number(yellowCards || 0) + Number(redCards || 0);
+  const cardsAverage = explicitAverage
+    ? toNumber(explicitAverage)
+    : games && totalCards
+      ? Number((totalCards / games).toFixed(2))
+      : undefined;
+
+  return {
+    profileTitle: title,
+    games,
+    yellowCards,
+    redCards,
+    cardsAverage,
+    country,
+    profileText: [...personalLines, ...historyLines].join(' ').slice(0, 1800),
+  };
+}
+
+async function fetchRefereeProfile(page: Page, href?: string) {
+  if (!href) return {};
+  const cacheKey = absoluteUrl(href);
+  const cached = refereeProfileCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.promise;
+
+  const promise = (async () => {
+    try {
+      await loadPageText(page, cacheKey);
+      const profile = await page.evaluate(() => ({
+        title: document.title,
+        text: document.body.innerText,
+      }));
+      return parseRefereeProfile(profile.text, profile.title);
+    } catch (err) {
+      return {
+        profileError: err instanceof Error ? err.message : String(err),
+      };
+    }
+  })();
+
+  refereeProfileCache.set(cacheKey, { expiresAt: Date.now() + CACHE_TTL_MS, promise });
+  return promise;
+}
+
 function parseCompetitionTable(section: string, homeTeam: string, awayTeam: string) {
   const lines = linesFrom(section);
   const rows = lines
@@ -639,6 +748,13 @@ function buildOgolContext(details: OgolEventDetails) {
   return {
     venue: parseVenueContext(details.text, sections),
     referee: parseRefereeContext(details.text, sections, details.anchors),
+    players: (details.entities?.players || []).slice(0, 36).map((player) => ({
+      id: parseEntityIdFromUrl(player.href),
+      name: player.name,
+      href: player.href,
+      side: player.sideHint,
+      context: player.context.slice(0, 300),
+    })),
     competitionTable: parseCompetitionTable(group, details.match.homeTeam, details.match.awayTeam),
     headToHead: sectionByName(sections, /CONFRONTOS/i).slice(0, 1000),
     competitionStatsText: stats.slice(0, 1800),
@@ -909,6 +1025,27 @@ async function loadOgolDetails(eventId: number | string): Promise<OgolEventDetai
           const key = heading.text;
           if (key && section?.innerText) sections[key] = section.innerText.replace(/\s+\n/g, '\n').trim();
         }
+        const entityLinks = [...document.querySelectorAll<HTMLAnchorElement>('a[href]')]
+          .map((anchor) => {
+            const container = anchor.closest('tr,li,article,section,[class*="player"],[class*="lineup"],[class*="equipa"],div') as HTMLElement | null;
+            const section = anchor.closest('section,article') as HTMLElement | null;
+            const rect = anchor.getBoundingClientRect();
+            const contexts: string[] = [];
+            let parent = anchor.parentElement;
+            for (let depth = 0; parent && depth < 7; depth += 1, parent = parent.parentElement) {
+              const parentText = parent.innerText.replace(/\s+/g, ' ').trim();
+              if (parentText && parentText.length <= 2000 && !contexts.includes(parentText)) contexts.push(parentText);
+            }
+            return {
+              name: anchor.innerText.trim(),
+              href: anchor.href,
+              context: (container?.innerText || anchor.innerText).replace(/\s+/g, ' ').trim().slice(0, 500),
+              contexts,
+              sectionTitle: (section?.querySelector('h1,h2,h3,h4') as HTMLElement | null)?.innerText?.trim(),
+              sideHint: rect.left + rect.width / 2 < document.documentElement.clientWidth / 2 ? 'home' : 'away',
+            };
+          })
+          .filter((item) => item.name && item.href);
         return {
           title: document.title,
           h1: [...document.querySelectorAll('h1')].map((heading) => (heading as HTMLElement).innerText.trim())[0] || '',
@@ -918,6 +1055,10 @@ async function loadOgolDetails(eventId: number | string): Promise<OgolEventDetai
             text: anchor.innerText.trim(),
             href: anchor.href,
           })),
+          entities: {
+            players: entityLinks.filter((item) => /\/jogador(?:\/|\.php)|\/player\//i.test(item.href)),
+            referees: entityLinks.filter((item) => /\/arbitro(?:\/|\.php)|referee\.php/i.test(item.href)),
+          },
         };
       });
       const pageTeams = parseTeamsFromDetails(data.title, data.h1);
@@ -934,17 +1075,57 @@ async function loadOgolDetails(eventId: number | string): Promise<OgolEventDetai
         ...data.sections,
         ...extractKnownSections(data.text),
       };
+      const inferSide = (entity: { context: string; contexts?: string[]; sideHint: string }) => {
+        const contexts = [entity.context, ...(entity.contexts || [])];
+        const home = normalizeText(detailMatch.homeTeam);
+        const away = normalizeText(detailMatch.awayTeam);
+        const teamContext = contexts.find((value) => {
+          const normalized = normalizeText(value);
+          return (normalized.includes(home) && !normalized.includes(away))
+            || (normalized.includes(away) && !normalized.includes(home));
+        });
+        if (teamContext) return normalizeText(teamContext).includes(home) ? 'home' : 'away';
+        return entity.sideHint as 'home' | 'away';
+      };
+      const usefulContext = (entity: { name: string; context: string; contexts?: string[] }) =>
+        entity.contexts?.find((value) => value.length > entity.name.length && value.length < 1000) || entity.context;
       const baseDetails = {
         match: detailMatch,
         title: data.title,
         text: data.text,
         sections,
         anchors: data.anchors,
+        entities: {
+          players: data.entities.players.map((player) => ({
+            ...player,
+            name: cleanEntityName(player.name),
+            context: usefulContext(player),
+            sideHint: inferSide(player),
+          })),
+          referees: data.entities.referees.map((referee) => ({
+            ...referee,
+            name: cleanEntityName(referee.name),
+            sideHint: referee.sideHint as 'home' | 'away',
+          })),
+        },
       };
+
+      const context = buildOgolContext(baseDetails);
+      const refereeContext = context.referee as Record<string, unknown> | undefined;
+      const profile = await fetchRefereeProfile(page, String(refereeContext?.href || ''));
 
       return {
         ...baseDetails,
-        context: buildOgolContext(baseDetails),
+        context: {
+          ...context,
+          referee: {
+            ...refereeContext,
+            ...profile,
+            note: Object.keys(profile).some((key) => ['games', 'yellowCards', 'redCards', 'cardsAverage'].includes(key) && profile[key] !== undefined)
+              ? 'Perfil público do árbitro consultado no OGOL.'
+              : refereeContext?.note,
+          },
+        },
       };
     });
   })();
@@ -1104,24 +1285,46 @@ function sectionText(details: OgolEventDetails, name: RegExp) {
   return text.slice(heading.index, heading.index + 1200);
 }
 
-function playersFromSection(details: OgolEventDetails, section: string, sideName: string) {
-  const names = details.anchors
+function inferPlayerPosition(context: string) {
+  if (/goleiro|goalkeeper|\bgr\b/i.test(context)) return 'Goleiro';
+  if (/zagueiro|lateral|defensor|defesa|\bdf\b/i.test(context)) return 'Defensor';
+  if (/meia|meio-campo|medio|\bmc\b|\bmei\b/i.test(context)) return 'Meio-campo';
+  if (/atacante|avancado|ponta|\bata\b|\bav\b/i.test(context)) return 'Atacante';
+  return undefined;
+}
+
+function playersFromSection(details: OgolEventDetails, section: string, sideName: string, side: 'home' | 'away') {
+  const structured = (details.entities?.players || []).filter((entity) => {
+    const belongsToSection = !section
+      || section.includes(entity.name)
+      || normalizeText(entity.sectionTitle).includes('titular')
+      || normalizeText(entity.sectionTitle).includes('desfalque');
+    return belongsToSection && (!entity.sideHint || entity.sideHint === side);
+  });
+  const fallback = details.anchors
     .filter((anchor) => section.includes(anchor.text) && anchor.text.length > 2 && !/ver mais|historico|odds/i.test(anchor.text))
-    .map((anchor) => anchor.text);
-  return [...new Set(names)].slice(0, 18).map((name, index) => ({
+    .map((anchor) => ({ name: cleanEntityName(anchor.text), href: anchor.href, context: anchor.text }));
+  const candidates = structured.length ? structured : fallback;
+  const unique = [...new Map(candidates.map((entity) => [normalizeText(entity.name), entity])).values()]
+    .filter((entity) => entity.name.length > 2 && !/ver mais|historico|odds/i.test(entity.name))
+    .slice(0, 18);
+
+  return unique.map((entity, index) => ({
     avgRating: undefined,
     player: {
-      id: teamId(`${sideName}:${name}`),
-      name,
-      slug: toSlug(name),
-      shortName: name,
-      position: undefined,
+      id: parseEntityIdFromUrl(entity.href) || teamId(`${sideName}:${entity.name}`),
+      name: entity.name,
+      slug: toSlug(entity.name),
+      shortName: entity.name,
+      position: inferPlayerPosition(entity.context),
+      href: entity.href,
     },
     teamId: teamId(sideName),
     shirtNumber: undefined,
-    position: undefined,
-    substitute: index >= 11,
-    captain: false,
+    position: inferPlayerPosition(entity.context),
+    substitute: /banco|reserva|suplente/i.test(entity.context) || index >= 11,
+    captain: /capit[aã]o|\(c\)/i.test(entity.context),
+    profileText: entity.context,
   }));
 }
 
@@ -1131,8 +1334,8 @@ export async function fetchOgolLineups(eventId: number | string) {
 
   const starters = sectionText(details, /ultimos titulares|últimos titulares/i);
   const injuries = sectionText(details, /desfalques/i);
-  const homePlayers = playersFromSection(details, starters, details.match.homeTeam);
-  const awayPlayers = playersFromSection(details, starters, details.match.awayTeam).filter((player) =>
+  const homePlayers = playersFromSection(details, starters, details.match.homeTeam, 'home');
+  const awayPlayers = playersFromSection(details, starters, details.match.awayTeam, 'away').filter((player) =>
     !homePlayers.some((homePlayer) => homePlayer.player.name === player.player.name)
   );
 
@@ -1150,13 +1353,13 @@ export async function fetchOgolLineups(eventId: number | string) {
         team: { id: teamId(details.match.homeTeam), name: details.match.homeTeam },
         formation: undefined,
         players: homePlayers,
-        missingPlayers: playersFromSection(details, injuries, details.match.homeTeam).slice(0, 8),
+        missingPlayers: playersFromSection(details, injuries, details.match.homeTeam, 'home').slice(0, 8),
       },
       away: {
         team: { id: teamId(details.match.awayTeam), name: details.match.awayTeam },
         formation: undefined,
         players: awayPlayers,
-        missingPlayers: playersFromSection(details, injuries, details.match.awayTeam).slice(0, 8),
+        missingPlayers: playersFromSection(details, injuries, details.match.awayTeam, 'away').slice(0, 8),
       },
     },
   };
