@@ -70,6 +70,7 @@ type MatchDataProfile = {
   hasRecentHistory: boolean;
   recentMatches: number;
   hasIncidents: boolean;
+  incidentsApplicable?: boolean;
   incidents: number;
   hasCardsData: boolean;
   hasCornersData: boolean;
@@ -87,6 +88,7 @@ type MatchDataProfile = {
     startTimestamp?: number;
     score?: any;
   }>;
+  historySource?: string;
 };
 
 function parseEventIds(value: unknown): string[] {
@@ -241,6 +243,28 @@ function countRecentMatches(streaks: any) {
   return Number(data?.home?.length || 0) + Number(data?.away?.length || 0) + Number(data?.head2head?.length || 0);
 }
 
+function ogolContext(statistics: any) {
+  return statistics?.context || statistics?.raw?.context || {};
+}
+
+function countOgolHistoricalEvidence(statistics: any) {
+  const facts = ogolContext(statistics)?.seasonFacts || {};
+  const evidenceForSide = (side: any) => {
+    const matches = Number(side?.matches || 0);
+    if (matches > 0) return matches;
+    if (side?.form || String(side?.text || '').trim().length > 40) return 4;
+    return 0;
+  };
+  return evidenceForSide(facts.home) + evidenceForSide(facts.away);
+}
+
+function ogolRefereeHasCards(statistics: any) {
+  const referee = ogolContext(statistics)?.referee;
+  return Number(referee?.cardsAverage || 0) > 0
+    || Number(referee?.yellowCards || 0) > 0
+    || Number(referee?.redCards || 0) > 0;
+}
+
 function countIncidents(incidents: any) {
   const items = incidents?.data?.incidents || incidents?.incidents;
   return Array.isArray(items) ? items.length : 0;
@@ -289,19 +313,24 @@ async function inspectMatchData(eventId: string, event?: any): Promise<MatchData
 
   const statisticsItems = Math.max(countStatisticsItems(statistics), countStatisticsItems(scores365Stats));
   const lineupPlayers = Math.max(countLineupPlayers(lineups), countLineupPlayers(scores365Lineups));
-  const recentMatches = Math.max(countRecentMatches(streaks), countRecentMatches(scores365Streaks));
+  const arrayRecentMatches = Math.max(countRecentMatches(streaks), countRecentMatches(scores365Streaks));
+  const historicalEvidence = isOgolProvider ? countOgolHistoricalEvidence(statistics) : 0;
+  const recentMatches = Math.max(arrayRecentMatches, historicalEvidence);
   const incidentCount = Math.max(countIncidents(incidents), countIncidents(scores365Incidents));
+  const statusType = normalizeDataText(event?.status?.type);
+  const incidentsApplicable = ['live', 'inprogress', 'finished', 'afterpenalties', 'afterextra'].includes(statusType);
   const hasCardsData = incidentsHaveCards(incidents)
     || incidentsHaveCards(scores365Incidents)
     || statHasPattern(statistics, [/card|yellow|red|cartao|cartoes/])
-    || statHasPattern(scores365Stats, [/card|yellow|red|cartao|cartoes/]);
+    || statHasPattern(scores365Stats, [/card|yellow|red|cartao|cartoes/])
+    || (isOgolProvider && ogolRefereeHasCards(statistics));
   const hasCornersData = statHasPattern(statistics, [/corner|escanteio|corners/])
     || statHasPattern(scores365Stats, [/corner|escanteio|corners/]);
   const missing = [
     statisticsItems > 0 ? null : 'statistics',
     lineupPlayers >= 10 ? null : 'lineups_or_player_pool',
     recentMatches >= 4 ? null : 'recent_history',
-    incidentCount > 0 ? null : 'incidents',
+    !incidentsApplicable || incidentCount > 0 ? null : 'incidents',
     hasCardsData ? null : 'cards',
     hasCornersData ? null : 'corners',
   ].filter(Boolean) as string[];
@@ -309,7 +338,7 @@ async function inspectMatchData(eventId: string, event?: any): Promise<MatchData
     statisticsItems > 0 ? 30 : 0,
     lineupPlayers >= 10 ? 25 : lineupPlayers > 0 ? 12 : 0,
     recentMatches >= 8 ? 25 : recentMatches >= 4 ? 16 : recentMatches > 0 ? 8 : 0,
-    incidentCount > 0 ? 8 : 0,
+    !incidentsApplicable || incidentCount > 0 ? 8 : 0,
     hasCardsData ? 6 : 0,
     hasCornersData ? 6 : 0,
   ].reduce((total, value) => total + value, 0);
@@ -323,7 +352,8 @@ async function inspectMatchData(eventId: string, event?: any): Promise<MatchData
     lineupPlayers,
     hasRecentHistory: recentMatches >= 4,
     recentMatches,
-    hasIncidents: incidentCount > 0,
+    hasIncidents: !incidentsApplicable || incidentCount > 0,
+    incidentsApplicable,
     incidents: incidentCount,
     hasCardsData,
     hasCornersData,
@@ -341,6 +371,11 @@ async function inspectMatchData(eventId: string, event?: any): Promise<MatchData
       : needs365Scores
         ? '365scores fetch failed'
         : 'not_attempted: primary provider already had enough data for this profile',
+    historySource: arrayRecentMatches > 0
+      ? 'match_list'
+      : historicalEvidence > 0
+        ? 'ogol_season_facts'
+        : 'unavailable',
     scores365ScheduleAttempts: Array.isArray(scores365?.matchSearch?.scheduleAttempts)
       ? scores365.matchSearch.scheduleAttempts
       : undefined,
@@ -480,7 +515,9 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
       : [];
   const matches = filterMatchesForMode(events, config.mode);
   const candidateEvents = matches.slice(0, config.maxCandidates);
-  const profiles = await inspectProfilesWithConcurrency(candidateEvents, 2);
+  const ogolConcurrency = Math.max(1, Number(process.env.OGOL_ANALYSIS_CONCURRENCY || 1));
+  const concurrency = process.env.SCORES_PROVIDER === 'ogol' ? ogolConcurrency : 2;
+  const profiles = await inspectProfilesWithConcurrency(candidateEvents, concurrency);
   const qualified = profiles
     .filter((item) => isFullDataProfile(item.profile, config.strictMarkets))
     .sort((a, b) => b.profile.score - a.profile.score || eventCompletenessScore(b.event) - eventCompletenessScore(a.event));
@@ -493,7 +530,7 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
       ...rankedProfiles.filter((item) => !qualified.some((qualifiedItem) => String(qualifiedItem.event.id) === String(item.event.id))),
     ].slice(0, config.limit);
   const eventIds = selected.map((item) => String(item.event.id));
-  const { analyses, skipped } = await analyzeWithConcurrency(eventIds, options, 2);
+  const { analyses, skipped } = await analyzeWithConcurrency(eventIds, options, concurrency);
   const profileById = new Map(selected.map((item) => [String(item.event.id), item.profile]));
   const analysesWithProfiles = analyses
     .map((analysis) => ({
