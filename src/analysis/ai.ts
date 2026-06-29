@@ -1264,6 +1264,30 @@ function isActionableAnalysis(result: AnalysisResult | null) {
   return true;
 }
 
+function attachEventPresentation(result: AnalysisResult, event: any, lineups?: any): AnalysisResult {
+  const lineupData = lineups?.data || lineups;
+  return {
+    ...result,
+    eventId: event?.id ?? result.eventId,
+    homeTeam: event?.homeTeam ? {
+      id: event.homeTeam.id,
+      name: event.homeTeam.name,
+      shortName: event.homeTeam.shortName,
+      slug: event.homeTeam.slug,
+      imageUrl: lineupData?.home?.team?.imageUrl || event.homeTeam.imageUrl,
+    } : result.homeTeam,
+    awayTeam: event?.awayTeam ? {
+      id: event.awayTeam.id,
+      name: event.awayTeam.name,
+      shortName: event.awayTeam.shortName,
+      slug: event.awayTeam.slug,
+      imageUrl: lineupData?.away?.team?.imageUrl || event.awayTeam.imageUrl,
+    } : result.awayTeam,
+    tournamentName: event?.tournament?.name || result.tournamentName,
+    startTimestamp: event?.startTimestamp ?? event?.startTime ?? result.startTimestamp,
+  };
+}
+
 export async function analyzeEvent(eventId: number | string, options: AnalyzeOptions = {}): Promise<AnalysisResult> {
   const {
     useLLM = true,
@@ -1339,12 +1363,12 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
       scores365Resp
     );
     const llmAnalysis = await callLLMAnalysis(llmInput);
-    if (isActionableAnalysis(llmAnalysis.result)) return llmAnalysis.result as AnalysisResult;
+    if (isActionableAnalysis(llmAnalysis.result)) return attachEventPresentation(llmAnalysis.result as AnalysisResult, event, lineupsResp);
     llmError = llmAnalysis.error || (isOgolProvider
       ? 'LLM returned no actionable recommendation from OGOL data.'
       : 'LLM returned no actionable recommendation; using heuristic fallback.');
     if (isOgolProvider) {
-      return {
+      return attachEventPresentation({
         eventId,
         market: 'none',
         recommendation: 'sem entrada confiavel',
@@ -1357,7 +1381,7 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
           noOddsFallback: true,
           noHeuristicFallback: true,
         },
-      };
+      }, event, lineupsResp);
     }
   }
 
@@ -1371,13 +1395,13 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
         eventId,
         llmError,
       };
-      return result;
+      return attachEventPresentation(result, event, lineupsResp);
     }
   }
 
   const result = buildHeuristicRecommendations(event);
   result.meta = { ...(result.meta || {}), llmError };
-  return result;
+  return attachEventPresentation(result, event, lineupsResp);
 }
 
 export default analyzeEvent;

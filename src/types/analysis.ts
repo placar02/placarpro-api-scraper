@@ -23,6 +23,22 @@ export interface AnalysisResult {
   recommendation: string;
   confidence: number; // 0-100
   rationale: string;
+  homeTeam?: {
+    id?: number | string;
+    name: string;
+    shortName?: string;
+    slug?: string;
+    imageUrl?: string;
+  };
+  awayTeam?: {
+    id?: number | string;
+    name: string;
+    shortName?: string;
+    slug?: string;
+    imageUrl?: string;
+  };
+  tournamentName?: string;
+  startTimestamp?: number;
   matchAnalysis?: string;
   dataCoverage?: Record<string, unknown>;
   keyFactors?: string[];

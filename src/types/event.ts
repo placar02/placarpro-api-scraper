@@ -254,12 +254,14 @@ export interface NormalizedEvent {
     name: string;
     slug: string;
     shortName: string;
+    imageUrl?: string;
   };
   awayTeam: {
     id: number;
     name: string;
     slug: string;
     shortName: string;
+    imageUrl?: string;
   };
   score: {
     home: number;

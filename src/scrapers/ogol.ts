@@ -38,12 +38,22 @@ type OgolEventDetails = {
   text: string;
   sections: Record<string, string>;
   anchors: Array<{ text: string; href: string }>;
+  images?: OgolImageCandidate[];
   entities?: {
     players: OgolEntityLink[];
     referees: OgolEntityLink[];
     teams: OgolEntityLink[];
   };
   context?: Record<string, unknown>;
+};
+
+type OgolImageCandidate = {
+  url: string;
+  alt?: string;
+  title?: string;
+  context?: string;
+  width?: number;
+  height?: number;
 };
 
 type OgolEntityLink = {
@@ -59,6 +69,7 @@ type OgolTeamProfile = {
   url: string;
   text: string;
   players: OgolEntityLink[];
+  imageUrl?: string;
 };
 
 const matchCache = new Map<string, { expiresAt: number; promise: Promise<{ status: number; events: EventLive[]; raw: any }> }>();
@@ -152,6 +163,24 @@ function absoluteUrl(href: string) {
   } catch {
     return href;
   }
+}
+
+function pickTeamLogo(images: OgolImageCandidate[] = [], teamName: string) {
+  const team = normalizeText(teamName);
+  const ranked = images
+    .filter((image) => image.url && !/banner|publicidade|advert|pixel|avatar|user/i.test(image.url))
+    .map((image) => {
+      const description = normalizeText(`${image.alt || ''} ${image.title || ''} ${image.context || ''}`);
+      const url = normalizeText(image.url);
+      let score = 0;
+      if (description.includes(team)) score += 30;
+      if (url.includes(toSlug(teamName))) score += 16;
+      if (/logo|equip|equipa|team|escudo|emblem|bandeira/.test(url)) score += 8;
+      if (Number(image.width || 0) >= 40 && Number(image.height || 0) >= 40) score += 3;
+      return { image, score };
+    })
+    .sort((a, b) => b.score - a.score);
+  return ranked[0]?.score >= 16 ? ranked[0].image.url : undefined;
 }
 
 function dateToBrazilTimestamp(date?: string, time?: string) {
@@ -287,12 +316,14 @@ function toNormalizedEvent(details: OgolEventDetails): NormalizedEvent {
       name: live.homeTeam.name,
       slug: live.homeTeam.slug,
       shortName: live.homeTeam.shortName,
+      imageUrl: context?.teamLogos?.home,
     },
     awayTeam: {
       id: live.awayTeam.id,
       name: live.awayTeam.name,
       slug: live.awayTeam.slug,
       shortName: live.awayTeam.shortName,
+      imageUrl: context?.teamLogos?.away,
     },
     score: {
       home: live.homeScore.current,
@@ -755,6 +786,10 @@ function buildOgolContext(details: OgolEventDetails) {
   const awayFacts = sectionByName(sections, new RegExp(`FATOS\\s+${escapeRegExp(details.match.awayTeam)}`, 'i'));
 
   return {
+    teamLogos: {
+      home: pickTeamLogo(details.images, details.match.homeTeam),
+      away: pickTeamLogo(details.images, details.match.awayTeam),
+    },
     venue: parseVenueContext(details.text, sections),
     referee: parseRefereeContext(details.text, sections, details.anchors),
     players: (details.entities?.players || []).slice(0, 36).map((player) => ({
@@ -1077,6 +1112,23 @@ async function loadOgolDetails(eventId: number | string): Promise<OgolEventDetai
             text: anchor.innerText.trim(),
             href: anchor.href,
           })),
+          images: [...document.querySelectorAll<HTMLImageElement>('img')].map((image) => {
+            const source = image.getAttribute('data-src')
+              || image.getAttribute('data-original')
+              || image.currentSrc
+              || image.src;
+            return {
+              url: source ? new URL(source, window.location.href).href : '',
+              alt: image.alt,
+              title: image.title,
+              context: (image.closest('a,figure,[class*="team"],[class*="equipa"],div') as HTMLElement | null)?.innerText
+                ?.replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 300),
+              width: image.naturalWidth || image.width,
+              height: image.naturalHeight || image.height,
+            };
+          }).filter((image) => image.url),
           entities: {
             players: entityLinks.filter((item) => /\/jogador(?:\/|\.php)|\/player\//i.test(item.href)),
             referees: entityLinks.filter((item) => /\/arbitro(?:\/|\.php)|referee\.php/i.test(item.href)),
@@ -1118,6 +1170,7 @@ async function loadOgolDetails(eventId: number | string): Promise<OgolEventDetai
         text: data.text,
         sections,
         anchors: data.anchors,
+        images: data.images,
         entities: {
           players: data.entities.players.map((player) => ({
             ...player,
@@ -1398,6 +1451,10 @@ async function fetchTeamProfile(href?: string): Promise<OgolTeamProfile> {
     await loadPageText(page, url);
     return page.evaluate(() => ({
       text: document.body.innerText,
+      imageUrl: (document.querySelector('meta[property="og:image"]') as HTMLMetaElement | null)?.content
+        || [...document.querySelectorAll<HTMLImageElement>('img')]
+          .map((image) => image.getAttribute('data-src') || image.getAttribute('data-original') || image.currentSrc || image.src)
+          .find((source) => source && /logo|equip|equipa|team|escudo|emblem/i.test(source)),
       players: [...document.querySelectorAll<HTMLAnchorElement>('a[href]')]
         .filter((anchor) => /\/jogador(?:\/|\.php)|\/player\//i.test(anchor.href))
         .map((anchor) => {
@@ -1414,6 +1471,7 @@ async function fetchTeamProfile(href?: string): Promise<OgolTeamProfile> {
   }).then((profile) => ({
     url,
     text: profile.text,
+    imageUrl: profile.imageUrl ? absoluteUrl(profile.imageUrl) : undefined,
     players: profile.players.map((player) => ({
       ...player,
       name: cleanEntityName(player.name),
@@ -1453,15 +1511,22 @@ export async function fetchOgolLineups(eventId: number | string) {
     || normalizeText(team.name).includes(normalizeText(details.match.homeTeam)));
   const awayTeamLink = details.entities?.teams.find((team) => team.sideHint === 'away'
     || normalizeText(team.name).includes(normalizeText(details.match.awayTeam)));
+  const context = (details.context || {}) as any;
+  let homeProfile: OgolTeamProfile | undefined;
+  let awayProfile: OgolTeamProfile | undefined;
+  const homeNeedsProfileLogo = !context?.teamLogos?.home || /bandeira|flag/i.test(context.teamLogos.home);
+  const awayNeedsProfileLogo = !context?.teamLogos?.away || /bandeira|flag/i.test(context.teamLogos.away);
 
-  if (homePlayers.length < 10 && homeTeamLink?.href) {
-    const profile = await fetchTeamProfile(homeTeamLink.href);
-    homePlayers = playerRowsFromEntities(profile.players, details.match.homeTeam);
+  if ((homePlayers.length < 10 || homeNeedsProfileLogo) && homeTeamLink?.href) {
+    homeProfile = await fetchTeamProfile(homeTeamLink.href);
+    if (homePlayers.length < 10) homePlayers = playerRowsFromEntities(homeProfile.players, details.match.homeTeam);
   }
-  if (awayPlayers.length < 10 && awayTeamLink?.href) {
-    const profile = await fetchTeamProfile(awayTeamLink.href);
-    awayPlayers = playerRowsFromEntities(profile.players, details.match.awayTeam)
-      .filter((player) => !homePlayers.some((homePlayer) => homePlayer.player.name === player.player.name));
+  if ((awayPlayers.length < 10 || awayNeedsProfileLogo) && awayTeamLink?.href) {
+    awayProfile = await fetchTeamProfile(awayTeamLink.href);
+    if (awayPlayers.length < 10) {
+      awayPlayers = playerRowsFromEntities(awayProfile.players, details.match.awayTeam)
+        .filter((player) => !homePlayers.some((homePlayer) => homePlayer.player.name === player.player.name));
+    }
   }
 
   return {
@@ -1475,13 +1540,21 @@ export async function fetchOgolLineups(eventId: number | string) {
       confirmed: Boolean(homePlayers.length || awayPlayers.length),
       source: 'ogol',
       home: {
-        team: { id: teamId(details.match.homeTeam), name: details.match.homeTeam },
+        team: {
+          id: teamId(details.match.homeTeam),
+          name: details.match.homeTeam,
+          imageUrl: homeProfile?.imageUrl || context?.teamLogos?.home,
+        },
         formation: undefined,
         players: homePlayers,
         missingPlayers: playersFromSection(details, injuries, details.match.homeTeam, 'home').slice(0, 8),
       },
       away: {
-        team: { id: teamId(details.match.awayTeam), name: details.match.awayTeam },
+        team: {
+          id: teamId(details.match.awayTeam),
+          name: details.match.awayTeam,
+          imageUrl: awayProfile?.imageUrl || context?.teamLogos?.away,
+        },
         formation: undefined,
         players: awayPlayers,
         missingPlayers: playersFromSection(details, injuries, details.match.awayTeam, 'away').slice(0, 8),
