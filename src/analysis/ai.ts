@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { fetchEvent, SofaScoreBlockedError } from '../scrapers/event';
 import { fetchAiScoreIncidents, fetchAiScoreLineups, fetchAiScoreOdds, fetchAiScoreStatistics, fetchAiScoreStreaks } from '../scrapers/aiscore';
 import { fetchIncidents } from '../scrapers/incidents';
@@ -8,6 +9,7 @@ import { fetch365Enrichment } from '../scrapers/scores365-enrichment';
 import { fetchStatistics } from '../scrapers/statistics';
 import { fetchStreaks } from '../scrapers/streaks';
 import { fetchTopPlayers } from '../scrapers/top-players';
+import { applySelectiveDecisionGate, normalizeUnavailableData, NO_RECOMMENDATION, OPTIONAL_DATA_UNAVAILABLE } from './decision-engine';
 import type { AnalysisResult, AnalyzeOptions, BettingRecommendation } from '../types/analysis';
 
 interface LLMAnalysisInput {
@@ -30,10 +32,112 @@ interface LLMAnalysisResponse {
   error?: string;
 }
 
+const azureResponseCache = new Map<string, { expiresAt: number; value: LLMAnalysisResponse }>();
+const azureInFlight = new Map<string, Promise<LLMAnalysisResponse>>();
+let activeAzureRequests = 0;
+const azureWaiters: Array<() => void> = [];
+let azureRateLimitedUntil = 0;
+let azureRateLimitReason = '';
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withAzureSlot<T>(task: () => Promise<T>): Promise<T> {
+  const concurrency = Math.max(1, Number(process.env.AZURE_OPENAI_CONCURRENCY || 1));
+  if (activeAzureRequests >= concurrency) {
+    await new Promise<void>((resolve) => azureWaiters.push(resolve));
+  }
+  activeAzureRequests += 1;
+  try {
+    return await task();
+  } finally {
+    activeAzureRequests -= 1;
+    azureWaiters.shift()?.();
+  }
+}
+
+function azureInputKey(input: LLMAnalysisInput) {
+  return createHash('sha256')
+    .update(`${process.env.AZURE_OPENAI_DEPLOYMENT_NAME || ''}:${JSON.stringify(input)}`)
+    .digest('hex');
+}
+
+function pruneAzureCache() {
+  while (azureResponseCache.size > 200) {
+    const firstKey = azureResponseCache.keys().next().value;
+    if (!firstKey) break;
+    azureResponseCache.delete(firstKey);
+  }
+}
+
+function compactReasoningValue(value: any, depth = 0, aggressive = false): any {
+  if (value === null || value === undefined || typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'string') return value.slice(0, aggressive ? 120 : 240);
+  if (Array.isArray(value)) {
+    const limit = aggressive ? 6 : depth <= 2 ? 12 : 8;
+    return value.slice(0, limit).map((item) => compactReasoningValue(item, depth + 1, aggressive));
+  }
+  if (typeof value === 'object') {
+    const ignored = new Set(['raw', 'rawResponse', 'profileText', 'textLines', 'pages', 'allTables', 'allStatistics']);
+    return Object.fromEntries(Object.entries(value)
+      .filter(([key]) => !ignored.has(key))
+      .slice(0, aggressive ? 24 : 40)
+      .map(([key, item]) => [key, compactReasoningValue(item, depth + 1, aggressive)]));
+  }
+  return String(value);
+}
+
+export function compactReasoningInput(input: LLMAnalysisInput) {
+  const maxChars = Math.max(8000, Number(process.env.AZURE_OPENAI_MAX_INPUT_CHARS || 24000));
+  let compact = compactReasoningValue(input);
+  if (JSON.stringify(compact).length > maxChars) compact = compactReasoningValue(input, 0, true);
+  return compact;
+}
+
+export async function fetchAzureWithRetry(url: string, requestBody: unknown, apiKey: string, timeoutMs: number) {
+  const retries = Math.max(0, Number(process.env.AZURE_OPENAI_RETRIES || 0));
+  const baseDelayMs = Math.max(250, Number(process.env.AZURE_OPENAI_RETRY_BASE_MS || 2000));
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'api-key': apiKey },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      });
+      const retryable = response.status === 429 || response.status >= 500;
+      if (!retryable || attempt >= retries) return response;
+
+      const retryAfterMs = Number(response.headers.get('x-ms-retry-after-ms') || 0);
+      const retryAfterSeconds = Number(response.headers.get('retry-after') || 0);
+      const backoffMs = Math.min(60000, Math.max(
+        retryAfterMs,
+        retryAfterSeconds * 1000,
+        baseDelayMs * (2 ** attempt) + Math.floor(Math.random() * 500),
+      ));
+      await response.text().catch(() => '');
+      console.warn(`Azure OpenAI ${response.status}; nova tentativa ${attempt + 2}/${retries + 1} em ${backoffMs}ms.`);
+      await delay(backoffMs);
+    } catch (error) {
+      if (attempt >= retries) throw error;
+      const backoffMs = Math.min(60000, baseDelayMs * (2 ** attempt) + Math.floor(Math.random() * 500));
+      console.warn(`Azure OpenAI request failed; retrying in ${backoffMs}ms:`, error instanceof Error ? error.message : String(error));
+      await delay(backoffMs);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  throw new Error('Azure OpenAI retry loop exhausted');
+}
+
 function buildRecommendation(data: Partial<BettingRecommendation>): BettingRecommendation {
   const confidence = typeof data.confidence === 'number'
     ? data.confidence <= 1 ? Math.round(data.confidence * 100) : data.confidence
-    : 50;
+    : 0;
 
   return {
     market: data.market || 'unknown',
@@ -182,6 +286,109 @@ function enrichAnalysisWithRealOdds(result: AnalysisResult, oddsResp: any): Anal
   };
 }
 
+function summarizeOgolDeepData(richData: any) {
+  const deep = richData?.analysisReady;
+  if (!richData?.available || !deep) return undefined;
+  const compactAggregate = (aggregate: any) => aggregate ? {
+    played: aggregate.played,
+    wins: aggregate.wins,
+    draws: aggregate.draws,
+    losses: aggregate.losses,
+    goalsFor: aggregate.goalsFor,
+    goalsAgainst: aggregate.goalsAgainst,
+    cleanSheets: aggregate.cleanSheets,
+    failedToScore: aggregate.failedToScore,
+    winRate: aggregate.winRate,
+    avgGoalsFor: aggregate.avgGoalsFor,
+    avgGoalsAgainst: aggregate.avgGoalsAgainst,
+    bttsRate: aggregate.bttsRate,
+    over25Rate: aggregate.over25Rate,
+    under25Rate: aggregate.under25Rate,
+  } : undefined;
+  const compactTeam = (team: any) => team ? {
+    name: team.name,
+    coach: team.coach,
+    averageAge: team.averageAge,
+    squadValue: team.squadValue,
+    tablePosition: team.tablePosition,
+    injuries: limitArray(team.injuries, 10),
+    suspensions: limitArray(team.suspensions, 10),
+    recent: {
+      last5: compactAggregate(team.recent?.last5),
+      last10: compactAggregate(team.recent?.last10),
+      last20: compactAggregate(team.recent?.last20),
+      home: compactAggregate(team.recent?.home),
+      away: compactAggregate(team.recent?.away),
+    },
+  } : undefined;
+  return {
+    coverage: richData.coverage,
+    match: {
+      competition: deep.match?.competition,
+      round: deep.match?.round,
+      date: deep.match?.date,
+      time: deep.match?.time,
+      stadium: deep.match?.stadium,
+      city: deep.match?.city,
+      referee: deep.match?.referee,
+      attendance: deep.match?.attendance,
+      weather: deep.match?.weather,
+      broadcast: deep.match?.broadcast,
+      score: deep.match?.score,
+      minute: deep.match?.minute,
+      events: limitArray(deep.match?.events, 40),
+      statistics: limitArray(deep.match?.statistics, 80).map((item: any) => ({
+        label: item.label,
+        values: item.values,
+        text: String(item.text || '').slice(0, 240),
+        section: item.section,
+      })),
+    },
+    teams: {
+      home: compactTeam(deep.teams?.home),
+      away: compactTeam(deep.teams?.away),
+    },
+    headToHead: deep.headToHead ? {
+      played: deep.headToHead.played,
+      homeWins: deep.headToHead.homeWins,
+      awayWins: deep.headToHead.awayWins,
+      draws: deep.headToHead.draws,
+      avgGoals: deep.headToHead.avgGoals,
+      avgCorners: deep.headToHead.avgCorners,
+      avgCards: deep.headToHead.avgCards,
+      bttsRate: deep.headToHead.bttsRate,
+      over25Rate: deep.headToHead.over25Rate,
+      under25Rate: deep.headToHead.under25Rate,
+      firstGoal: deep.headToHead.firstGoal,
+    } : undefined,
+    competition: deep.competition ? {
+      keyValues: limitArray(deep.competition.keyValues, 40),
+      standingsAndCampaign: limitArray(deep.competition.standingsAndCampaign, 8).map((table: any) => ({
+        caption: table.caption,
+        section: table.section,
+        headers: table.headers,
+        rows: limitArray(table.rows, 25),
+      })),
+      statistics: limitArray(deep.competition.statistics, 40),
+    } : undefined,
+    players: limitArray(deep.players, 22).map((player: any) => ({
+      name: player.name,
+      lineupRole: player.lineupRole,
+      position: player.position,
+      age: player.age,
+      minutes: player.minutes,
+      goals: player.goals,
+      assists: player.assists,
+      cards: player.cards,
+      averageRating: player.averageRating,
+      consecutiveMatches: player.consecutiveMatches,
+      recentForm: player.recentForm,
+      goalParticipation: player.goalParticipation,
+      efficiency: player.efficiency,
+    })),
+  };
+}
+
 function summarizeStatistics(statisticsResp: any) {
   if (!statisticsResp?.by_period) return undefined;
 
@@ -190,7 +397,7 @@ function summarizeStatistics(statisticsResp: any) {
     period,
     groups: Object.values(periodData.groups_by_name || {}).map((group: any) => ({
       group: group.group_name,
-      items: limitArray(group.items, 12).map((item: any) => ({
+      items: limitArray(group.items, 60).map((item: any) => ({
         name: item.name,
         home: item.home?.label ?? item.home?.value,
         away: item.away?.label ?? item.away?.value,
@@ -219,6 +426,7 @@ function summarizeStatistics(statisticsResp: any) {
     shotChart,
     summary: statisticsResp.summary,
     context: statisticsResp.context || statisticsResp.raw?.context,
+    deepData: summarizeOgolDeepData(statisticsResp.richData),
   };
 }
 
@@ -390,10 +598,24 @@ function summarizeDisciplineAndCorners(statisticsResp: any, incidentsResp: any) 
   };
 }
 
-function summarizeMatchForm(matches: any[], side: 'home' | 'away') {
+function summarizeMatchForm(matches: any[], subjectTeam: any, fallbackSide: 'home' | 'away') {
   const finished = limitArray(matches, 10)
     .map((match: any) => {
-      const isHomeSide = side === 'home';
+      const subjectId = String(subjectTeam?.id || '');
+      const subjectName = normalizeText(subjectTeam?.name || subjectTeam);
+      const homeId = String(match.homeTeam?.id || match.homeTeamId || '');
+      const awayId = String(match.awayTeam?.id || match.awayTeamId || '');
+      const homeName = normalizeText(match.homeTeam?.name || match.homeTeam);
+      const awayName = normalizeText(match.awayTeam?.name || match.awayTeam);
+      const isHomeSide = match.subjectSide === 'home'
+        || (match.subjectSide !== 'away' && Boolean(
+          (subjectId && homeId && subjectId === homeId)
+          || (subjectName && homeName && (subjectName === homeName || homeName.includes(subjectName)))
+        ))
+        || (match.subjectSide === undefined
+          && !(subjectId && awayId && subjectId === awayId)
+          && !(subjectName && awayName && (subjectName === awayName || awayName.includes(subjectName)))
+          && fallbackSide === 'home');
       const forScore = Number(isHomeSide ? match.homeScore ?? match.homeScores?.[0] : match.awayScore ?? match.awayScores?.[0]);
       const againstScore = Number(isHomeSide ? match.awayScore ?? match.awayScores?.[0] : match.homeScore ?? match.homeScores?.[0]);
       if (!Number.isFinite(forScore) || !Number.isFinite(againstScore)) return null;
@@ -412,13 +634,15 @@ function summarizeMatchForm(matches: any[], side: 'home' | 'away') {
         over25: forScore + againstScore > 2.5,
         cleanSheet: againstScore === 0,
         failedToScore: forScore === 0,
+        venue: isHomeSide ? 'home' : 'away',
         leaguePosition: isHomeSide ? match.ext?.homePosition : match.ext?.awayPosition,
       };
     })
     .filter(Boolean) as any[];
 
-  const played = finished.length;
-  const totals = finished.reduce((acc, match) => {
+  const summarize = (sample: any[]) => {
+    const played = sample.length;
+    const totals = sample.reduce((acc, match) => {
     acc.wins += match.result === 'W' ? 1 : 0;
     acc.draws += match.result === 'D' ? 1 : 0;
     acc.losses += match.result === 'L' ? 1 : 0;
@@ -431,30 +655,43 @@ function summarizeMatchForm(matches: any[], side: 'home' | 'away') {
     return acc;
   }, { wins: 0, draws: 0, losses: 0, goalsFor: 0, goalsAgainst: 0, btts: 0, over25: 0, cleanSheets: 0, failedToScore: 0 });
 
+    return {
+      played,
+      wins: totals.wins,
+      draws: totals.draws,
+      losses: totals.losses,
+      winRate: played ? Number(((totals.wins / played) * 100).toFixed(0)) : undefined,
+      record: `${totals.wins}W-${totals.draws}D-${totals.losses}L`,
+      avgGoalsFor: played ? Number((totals.goalsFor / played).toFixed(2)) : undefined,
+      avgGoalsAgainst: played ? Number((totals.goalsAgainst / played).toFixed(2)) : undefined,
+      bttsRate: played ? Number(((totals.btts / played) * 100).toFixed(0)) : undefined,
+      over25Rate: played ? Number(((totals.over25 / played) * 100).toFixed(0)) : undefined,
+      cleanSheetRate: played ? Number(((totals.cleanSheets / played) * 100).toFixed(0)) : undefined,
+      failedToScoreRate: played ? Number(((totals.failedToScore / played) * 100).toFixed(0)) : undefined,
+    };
+  };
+
   return {
-    played,
-    record: `${totals.wins}W-${totals.draws}D-${totals.losses}L`,
-    avgGoalsFor: played ? Number((totals.goalsFor / played).toFixed(2)) : undefined,
-    avgGoalsAgainst: played ? Number((totals.goalsAgainst / played).toFixed(2)) : undefined,
-    bttsRate: played ? Number(((totals.btts / played) * 100).toFixed(0)) : undefined,
-    over25Rate: played ? Number(((totals.over25 / played) * 100).toFixed(0)) : undefined,
-    cleanSheetRate: played ? Number(((totals.cleanSheets / played) * 100).toFixed(0)) : undefined,
-    failedToScoreRate: played ? Number(((totals.failedToScore / played) * 100).toFixed(0)) : undefined,
+    ...summarize(finished),
+    last5: summarize(finished.slice(0, 5)),
+    last10: summarize(finished),
+    homePerformance: summarize(finished.filter((match) => match.venue === 'home')),
+    awayPerformance: summarize(finished.filter((match) => match.venue === 'away')),
     latestLeaguePosition: finished.find((match) => match.leaguePosition)?.leaguePosition,
     recentMatches: finished,
   };
 }
 
-function buildTeamFormSummary(streaksResp: any, statisticsResp: any, incidentsResp: any) {
+function buildTeamFormSummary(streaksResp: any, statisticsResp: any, incidentsResp: any, event?: any) {
   const data = streaksResp?.data || streaksResp;
   if (!data) return {
     disciplineAndCorners: summarizeDisciplineAndCorners(statisticsResp, incidentsResp),
   };
 
   return {
-    homeRecent: summarizeMatchForm(data.home || [], 'home'),
-    awayRecent: summarizeMatchForm(data.away || [], 'away'),
-    headToHead: summarizeMatchForm(data.head2head || [], 'home'),
+    homeRecent: summarizeMatchForm(data.home || [], event?.homeTeam, 'home'),
+    awayRecent: summarizeMatchForm(data.away || [], event?.awayTeam, 'away'),
+    headToHead: summarizeMatchForm(data.head2head || [], event?.homeTeam, 'home'),
     homeFuture: limitArray(data.homeFuture, 5),
     awayFuture: limitArray(data.awayFuture, 5),
     teams: limitArray(data.teams, 8),
@@ -478,25 +715,26 @@ function hasPlayerData(input: LLMAnalysisInput) {
 }
 
 function normalizeGeneratedAnalysis(parsed: any, input: LLMAnalysisInput) {
-  const normalized = { ...parsed };
+  const unavailable = OPTIONAL_DATA_UNAVAILABLE;
+  const normalized = normalizeUnavailableData({ ...parsed });
   const quality = input.dataQuality || {};
   const marketBreakdown = {
     ...(normalized.marketBreakdown || {}),
   };
 
   if (!quality.hasCardsData) {
-    marketBreakdown.cards = 'sem dados';
+    marketBreakdown.cards = unavailable;
   }
   if (!quality.hasCornersData) {
-    marketBreakdown.corners = 'sem dados';
+    marketBreakdown.corners = unavailable;
   }
   if (!hasPlayerData(input)) {
-    marketBreakdown.playerProps = 'sem dados';
+    marketBreakdown.playerProps = unavailable;
     normalized.playerAnalysis = {
       ...(normalized.playerAnalysis || {}),
       available: false,
       mainPlayers: [],
-      unsupportedPlayerMarkets: ['sem dados'],
+      unsupportedPlayerMarkets: [unavailable],
     };
   }
 
@@ -505,9 +743,9 @@ function normalizeGeneratedAnalysis(parsed: any, input: LLMAnalysisInput) {
   if (!referee || !referee?.id || refereeName === 'unknown' || refereeName === 'desconhecido') {
     normalized.refereeAnalysis = {
       available: false,
-      summary: 'sem dados',
-      cardsTrend: 'sem dados',
-      bettingImpact: 'sem dados',
+      summary: unavailable,
+      cardsTrend: unavailable,
+      bettingImpact: unavailable,
     };
   }
 
@@ -692,7 +930,7 @@ function summarize365PlayerProps(game: any) {
 
 function build365LLMInput(raw: any, normalizedEvent: any, statisticsResp: any, incidentsResp: any, lineupsResp: any, streaksResp: any, scores365Resp?: any): LLMAnalysisInput {
   const game = raw.game || {};
-  const teamForm = buildTeamFormSummary(streaksResp, statisticsResp, incidentsResp);
+  const teamForm = buildTeamFormSummary(streaksResp, statisticsResp, incidentsResp, normalizedEvent);
   const scores365 = summarize365Enrichment(scores365Resp);
   const scores365Discipline = scores365?.disciplineAndCorners;
   const ownDiscipline = teamForm.disciplineAndCorners;
@@ -743,7 +981,7 @@ function buildLLMInput(event: any, oddsResp: any, statisticsResp: any, incidents
   const sourceEvent = event?.raw?.event || event?.data || event;
   const normalizedEvent = sourceEvent.event || sourceEvent;
   const source = process.env.SCORES_PROVIDER || 'sofascore';
-  const teamForm = buildTeamFormSummary(streaksResp, statisticsResp, incidentsResp);
+  const teamForm = buildTeamFormSummary(streaksResp, statisticsResp, incidentsResp, normalizedEvent);
   const scores365 = summarize365Enrichment(scores365Resp);
   const ownDiscipline = teamForm.disciplineAndCorners;
   const scores365Discipline = scores365?.disciplineAndCorners;
@@ -875,12 +1113,46 @@ function selectBestRecommendation(recommendations: BettingRecommendation[], even
 }
 
 async function callLLMAnalysis(input: LLMAnalysisInput): Promise<LLMAnalysisResponse> {
+  const key = azureInputKey(input);
+  const cached = azureResponseCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (cached) azureResponseCache.delete(key);
+
+  const running = azureInFlight.get(key);
+  if (running) return running;
+
+  const promise = withAzureSlot(() => performLLMAnalysis(input))
+    .then((response) => {
+      if (response.result) {
+        const ttlMs = Math.max(1000, Number(process.env.AZURE_OPENAI_CACHE_TTL_MS || 15 * 60 * 1000));
+        azureResponseCache.set(key, { expiresAt: Date.now() + ttlMs, value: response });
+        pruneAzureCache();
+      }
+      return response;
+    })
+    .finally(() => azureInFlight.delete(key));
+  azureInFlight.set(key, promise);
+  return promise;
+}
+
+async function performLLMAnalysis(input: LLMAnalysisInput): Promise<LLMAnalysisResponse> {
   const apiKey = process.env.AZURE_OPENAI_API_KEY;
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
   const deploymentName = process.env.AZURE_OPENAI_DEPLOYMENT_NAME;
   const timeoutMs = Number(process.env.AZURE_OPENAI_TIMEOUT_MS || 45000);
   const maxTokens = Number(process.env.AZURE_OPENAI_MAX_TOKENS || 2200);
   const eventData = input.event;
+  const isReasoningModel = process.env.AZURE_OPENAI_REASONING_MODEL === 'true'
+    || /^(gpt-5|o[134](?:-|$))/i.test(deploymentName || '');
+
+  const cooldownRemainingMs = azureRateLimitedUntil - Date.now();
+  if (cooldownRemainingMs > 0) {
+    const seconds = Math.ceil(cooldownRemainingMs / 1000);
+    return {
+      result: null,
+      error: `Azure OpenAI temporariamente em cooldown por rate limit (${seconds}s restantes). ${azureRateLimitReason}`.trim(),
+    };
+  }
 
   if (!apiKey || !endpoint || !deploymentName) {
     console.error('Azure OpenAI credentials missing:', {
@@ -898,13 +1170,13 @@ Use o perfil do arbitro para mercados de cartoes quando houver dados de jogos, a
 Use escalacoes, top players, posicoes, ratings e estatisticas de finalizacao/chances para avaliar mercados de jogador, como chute no gol, finalizacao, gol ou assistencia.
 Na fonte 365scores, considere que ha dados de jogador se existir qualquer um destes blocos: statistics.players, statistics.shotChart, topPerformers ou playerProps. Nao marque playerAnalysis.available como false quando esses blocos existirem.
 Na fonte aiscore, use event.source="aiscore" no dataCoverage.source. Considere que partidas pre-match podem nao ter estatisticas, escalações ou incidentes ainda; nesse caso, use os dados confirmados de evento, times, competição, local, status e arbitro para uma leitura conservadora, sem inventar forma recente.
-Na fonte ogol, use event.source="ogol" no dataCoverage.source. O OGOL vem de HTML publico e pode trazer agenda, status ao vivo, minuto, placar, odds 1x2, ultimos titulares, desfalques, estatisticas da competicao, fatos da temporada, confronto direto, estadio e arbitro. Use esses campos quando existirem e escreva "sem dados" para incidentes minuto a minuto, xG, heatmap ou props de jogador quando ausentes.
+Na fonte ogol, use event.source="ogol" no dataCoverage.source. O OGOL vem de HTML publico e pode trazer agenda, status ao vivo, minuto, placar, odds 1x2, ultimos titulares, desfalques, estatisticas da competicao, fatos da temporada, confronto direto, estadio e arbitro. Use esses campos quando existirem e escreva exatamente "Dado não disponível." para incidentes minuto a minuto, xG, heatmap ou props de jogador quando ausentes.
 Na fonte ogol, priorize statistics.context quando existir. Use competitionTable e teamNeeds para explicar situacao no campeonato/grupo, posicao, pontos, saldo aproximado por gols pro/contra e se o time precisa vencer. Use seasonFacts para forma, aproveitamento, gols marcados/sofridos e tendencias de marcar/sofrer. Use teamPeriods para comparar pontos, posicao, gols, gols esperados, chutes, escanteios, amarelos/vermelhos quando existirem. Use referee.name e referee.cardsAverage quando existir; se cardsAverage estiver ausente, diga que o arbitro foi identificado mas sem media publica no OGOL, e nao invente media. Para mercados de cartoes e faltas, so recomende se houver dado disciplinar real de arbitro, amarelos, vermelhos, faltas ou perfil de times faltosos. Para escanteios, use escanteios por jogo e volume de chutes. Para gols, use media de gols, gols esperados, gols marcados/sofridos e forma recente.
-Na fonte ogol, quando event.status.type="inprogress", o minuto/status e o placar atual sao dados concretos. Se nao houver estatisticas profundas, ainda assim faca uma leitura tecnica conservadora de mercados ao vivo sustentados pelo estado do jogo, como under/over de linha alta, proximo gol com cautela, dupla chance live ou aguardar entrada. Cite obrigatoriamente o minuto e o placar na justificativa. Nao use odds para decidir.
-Na fonte ogol, se event.status.type="inprogress" e houver placar atual, voce deve retornar pelo menos uma recommendation com confidence maior que 0 baseada somente no minuto e placar. Para jogo ao vivo com 0-0 antes do intervalo, prefira mercado conservador de gols como "under 3.5 gols ao vivo" ou "under 2.5 gols ao vivo" conforme a cautela dos dados. Nao retorne "sem entrada confiavel" nesse caso; use warningSigns para explicar os dados ausentes.
+Na fonte ogol, statistics.deepData contem o enriquecimento multipagina. Use match.statistics e match.events, os agregados last5/last10/last20 e casa/fora de teams, headToHead, classificacao/estatisticas de competition e os perfis de players. Campos dinamicos novos coletados de tabelas do OGOL sao dados validos mesmo quando nao aparecem nesta lista, mas cite o nome e o valor exatamente como recebidos.
+Na fonte ogol, quando event.status.type="inprogress", minuto, placar e estatisticas ao vivo sao dados concretos, mas minuto e placar sozinhos nunca bastam para recomendar uma entrada. Exija volume ofensivo, finalizacoes, posse, escanteios ou outro conjunto coerente de indicadores ao vivo. Cite obrigatoriamente minuto e placar quando houver recomendacao.
 Quando scores365.available=true, use scores365 como fonte complementar para estatisticas, odds reais, escanteios quando houver, cartoes, lineups, incidentes, streaks, placar/status e dados ao vivo. Cite scores365.scores365EventId e os campos concretos usados quando eles ajudarem a justificar a entrada.
 Se 365Scores nao encontrar correspondencia confiavel ou algum endpoint publico nao retornar dados, diga isso em dataCoverage.missingData, mas continue usando AiScore e os demais dados disponiveis.
-Use apenas os campos retornados em scores365.statistics, scores365.incidents, scores365.lineups, scores365.streaks e scores365.odds. Se um bloco estiver ausente, nao invente; escreva "sem dados" para o mercado afetado.
+Use apenas os campos retornados em scores365.statistics, scores365.incidents, scores365.lineups, scores365.streaks e scores365.odds. Se um bloco estiver ausente, nao invente; escreva exatamente "Dado não disponível." para o mercado afetado.
 Na fonte aiscore, use obrigatoriamente teamForm.homeRecent, teamForm.awayRecent, teamForm.headToHead, teamForm.disciplineAndCorners e lineups antes de dizer que faltam dados. Esses blocos resumem ultimas partidas, gols pro/contra, BTTS, over 2.5, clean sheets, posicao recente no campeonato, elenco, desfalques e estatisticas de jogo quando disponiveis.
 Para cartoes e escanteios, primeiro procure em teamForm.disciplineAndCorners.cardsFromStats, cardsFromIncidents, cornersFromStats, foulsFromStats e statistics.teamPeriods. Se existir qualquer valor concreto, faca uma leitura tecnica com cautela. So diga que nao ha dado concreto quando esses campos tambem estiverem vazios.
 Nao coloque "cartoes" ou "escanteios" em avoidMarkets apenas porque uma fonte secundaria nao retornou dados; se AiScore ou 365Scores tiver stats/incidentes ou historico suficiente, use esses dados. Se realmente nao houver dado numerico, diga a limitacao dentro de marketBreakdown sem transformar isso em entrada principal.
@@ -912,11 +1184,15 @@ So recomende mercado de jogador quando existir suporte nos dados esportivos envi
 Na fonte 365scores, o arbitro pode vir em event.referee vindo de officials. Se houver nome do arbitro mas sem media historica de cartoes, marque refereeAnalysis.available como true, informe que o arbitro foi identificado, e classifique cardsTrend como "historico indisponivel" em vez de "indisponivel". Use estatisticas de cartoes do jogo quando existirem.
 Considere tambem mercados de gols, ambas marcam, vencedor, dupla chance, handicap, escanteios, cartoes e entradas ao vivo quando os dados sustentarem.
 Nao escolha entradas por cotacao, odd baixa, odd favorita, voto popular, predicao de mercado ou probabilidade implicita de mercado. A recomendacao deve nascer somente da leitura tecnica da partida.
-Se algum dado de odd, cotacao, relatedLines, prediction ou mercado aparecer acidentalmente nos dados, ignore completamente para a decisao e para a justificativa.
+Se houver odd real, use-a apenas depois da estimativa estatistica para verificar valor esperado. Nunca use a odd para criar a recomendacao. Se o valor esperado nao for positivo, rejeite a entrada.
 Se algum bloco de dados estiver ausente, explique a incerteza sem inventar fatos.
-Nunca invente numeros, tendencias, arbitro, cartoes, escanteios, chutes ou dados de jogador. Tente usar todos os dados reais enviados primeiro; se depois disso nao houver dado concreto para um mercado, escreva exatamente "sem dados" naquele campo do marketBreakdown ou da analise correspondente.
+Nunca invente numeros, tendencias, arbitro, cartoes, escanteios, chutes ou dados de jogador. Tente usar todos os dados reais enviados primeiro; se depois disso nao houver dado concreto para um mercado, escreva exatamente "Dado não disponível." naquele campo do marketBreakdown ou da analise correspondente.
 Se a partida for pre-match, diferencie leitura provavel de fato confirmado.
 Evite frases genericas. Cite os dados concretos recebidos: status, local, top performers, escalacoes, estatisticas, desfalques, shot chart, incidentes e perfil de arbitro.
+Seja seletivo sem ser excessivamente restritivo. Dados opcionais ausentes nao impedem uma recomendacao de outro mercado. Uma recomendacao moderada pode usar 3 jogos recentes por equipe; com apenas 2, exija tambem amostra de temporada e estatisticas estruturadas. Sempre exija dados especificos do mercado e ausencia de conflito relevante.
+Nao transforme ausencia de dados em tendencia. Nao aumente confianca por intuicao, reputacao do time ou favoritismo presumido.
+Pode retornar recommendations vazio e bestRecommendation null. Prefira nao recomendar a publicar uma entrada apenas razoavel.
+Analise todos os mercados suportados, mas retorne no maximo 3 candidatos realmente fortes. O motor deterministico validara e publicara somente o melhor.
 Retorne APENAS um JSON valido neste formato:
 {
   "dataCoverage": {
@@ -1006,9 +1282,30 @@ Retorne APENAS um JSON valido neste formato:
   ],
   "riskAnalysis": "principais riscos que podem invalidar a entrada"
 }
-Inclua entre 5 e 8 recomendacoes quando houver dados suficientes, cubra categorias diferentes de mercado, escolha a melhor entrada com disciplina e nunca use texto fora do JSON.`;
+Quando nao houver vantagem clara, use "recommendations": [] e "bestRecommendation": null. Nunca use texto fora do JSON.`;
 
-    const requestBody = {
+    const reasoningPrompt = `Atue como analista profissional e seletivo de futebol.
+Use somente os dados recebidos. Nao invente estatisticas. Para campo opcional ausente escreva "Dado nao disponivel.".
+Compare forma recente, casa/fora, ataque, defesa, gols, escanteios, cartoes, chutes, xG, H2H, contexto da competicao, arbitro, desfalques e jogadores quando existirem.
+Analise gols, ambas marcam, resultado, dupla chance, handicap, escanteios, cartoes e props de jogador, mas recomende somente o mercado com evidencia objetiva convergente.
+Odds nunca criam a recomendacao; quando existirem, servem apenas para validar EV depois da estimativa esportiva.
+Se dados forem insuficientes ou conflitantes, retorne recommendations=[] e bestRecommendation=null.
+Responda somente JSON valido com: matchAnalysis, dataCoverage, keyFactors, homeAnalysis, awayAnalysis, refereeAnalysis, playerAnalysis, marketBreakdown, recommendations, bestRecommendation, confidenceDrivers, avoidMarkets e riskAnalysis.
+Cada recommendation deve ter market, recommendation, confidence de 0 a 100, riskLevel, dataSupport, warningSigns e rationale.`;
+    const requestInput = isReasoningModel ? compactReasoningInput(input) : input;
+    const requestPrompt = isReasoningModel ? reasoningPrompt : prompt;
+    const serializedInput = JSON.stringify(requestInput);
+    console.log(`Azure OpenAI payload: ${serializedInput.length} chars (${isReasoningModel ? 'compact reasoning' : 'standard'}).`);
+    const messages = [
+      { role: isReasoningModel ? 'developer' : 'system', content: 'Voce responde somente JSON valido e analisa futebol em portugues do Brasil.' },
+      { role: 'user', content: `${requestPrompt}\n\nDados:\n${serializedInput}` }
+    ];
+    const requestBody = isReasoningModel ? {
+      model: deploymentName,
+      messages,
+      max_completion_tokens: maxTokens,
+      reasoning_effort: process.env.AZURE_OPENAI_REASONING_EFFORT || 'minimal',
+    } : {
       messages: [
         { role: 'system', content: 'Voce responde somente JSON valido e analisa futebol em portugues do Brasil.' },
         { role: 'user', content: `${prompt}\n\nDados:\n${JSON.stringify(input)}` }
@@ -1017,28 +1314,33 @@ Inclua entre 5 e 8 recomendacoes quando houver dados suficientes, cubra categori
       max_tokens: maxTokens,
     };
 
-    const url = `${normalizeAzureEndpoint(endpoint)}openai/deployments/${deploymentName}/chat/completions?api-version=2024-02-15-preview`;
+    const apiVersion = process.env.AZURE_OPENAI_API_VERSION || '2024-02-15-preview';
+    const url = isReasoningModel
+      ? `${normalizeAzureEndpoint(endpoint)}openai/v1/chat/completions`
+      : `${normalizeAzureEndpoint(endpoint)}openai/deployments/${deploymentName}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`;
     console.log('Calling Azure OpenAI at:', url);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': apiKey,
-      },
-      body: JSON.stringify(requestBody),
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timeout));
+    const res = await fetchAzureWithRetry(url, requestBody, apiKey, timeoutMs);
 
     console.log('Azure OpenAI response status:', res.status);
 
     if (!res.ok) {
       const errorText = await res.text();
-      console.error(`Azure OpenAI error ${res.status}:`, errorText);
+      if (res.status === 429) {
+        const retryAfterMs = Number(res.headers.get('x-ms-retry-after-ms') || 0);
+        const retryAfterSeconds = Number(res.headers.get('retry-after') || 0);
+        const configuredCooldownMs = Math.max(30000, Number(process.env.AZURE_OPENAI_COOLDOWN_MS || 5 * 60 * 1000));
+        const cooldownMs = Math.max(retryAfterMs, retryAfterSeconds * 1000, configuredCooldownMs);
+        azureRateLimitedUntil = Date.now() + cooldownMs;
+        azureRateLimitReason = 'Novas chamadas foram suspensas para evitar mais respostas 429.';
+        console.warn(`Azure OpenAI circuit breaker aberto por ${Math.ceil(cooldownMs / 1000)}s.`);
+      }
+      const log = res.status === 429 ? console.warn : console.error;
+      log(`Azure OpenAI error ${res.status}:`, errorText);
       return { result: null, error: `Azure OpenAI error ${res.status}: ${errorText}` };
     }
+
+    azureRateLimitedUntil = 0;
+    azureRateLimitReason = '';
 
     const json = await res.json();
     const content = json?.choices?.[0]?.message?.content;
@@ -1069,8 +1371,27 @@ Inclua entre 5 e 8 recomendacoes quando houver dados suficientes, cubra categori
     }
 
     if (recommendations.length === 0) {
-      console.error('No valid recommendations extracted from Azure OpenAI response');
-      return { result: null, error: 'No valid recommendations extracted from Azure OpenAI response' };
+      const noEntryResult: AnalysisResult = {
+        eventId: eventData?.id ?? 'unknown',
+        market: 'none',
+        recommendation: NO_RECOMMENDATION,
+        confidence: 0,
+        rationale: 'A IA nao identificou vantagem estatistica clara nos mercados analisados.',
+        analysisSource: 'azure-openai',
+        matchAnalysis: typeof parsed.matchAnalysis === 'string' ? parsed.matchAnalysis : undefined,
+        dataCoverage: parsed.dataCoverage,
+        keyFactors: Array.isArray(parsed.keyFactors) ? parsed.keyFactors : undefined,
+        homeAnalysis: parsed.homeAnalysis,
+        awayAnalysis: parsed.awayAnalysis,
+        refereeAnalysis: parsed.refereeAnalysis,
+        playerAnalysis: parsed.playerAnalysis,
+        marketBreakdown: parsed.marketBreakdown,
+        confidenceDrivers: Array.isArray(parsed.confidenceDrivers) ? parsed.confidenceDrivers : undefined,
+        avoidMarkets: Array.isArray(parsed.avoidMarkets) ? parsed.avoidMarkets : undefined,
+        riskAnalysis: typeof parsed.riskAnalysis === 'string' ? parsed.riskAnalysis : undefined,
+        recommendations: [],
+      };
+      return { result: applySelectiveDecisionGate(noEntryResult, input) };
     }
 
     const result = selectBestRecommendation(recommendations, eventData?.id ?? 'unknown', 'azure-openai');
@@ -1091,8 +1412,9 @@ Inclua entre 5 e 8 recomendacoes quando houver dados suficientes, cubra categori
     result.bestEntry = parsed.bestRecommendation ? buildRecommendation(parsed.bestRecommendation) : recommendations[0];
     result.meta = { source: 'azure-openai', rawResponse: json, eventId: eventData?.id ?? 'unknown' };
     const enrichedResult = enrichAnalysisWithRealOdds(result, input.odds);
-    console.log('Azure OpenAI analysis success:', enrichedResult.analysisSource);
-    return { result: enrichedResult };
+    const gatedResult = applySelectiveDecisionGate(enrichedResult, input);
+    console.log('Azure OpenAI analysis success:', gatedResult.analysisSource);
+    return { result: gatedResult };
   } catch (err) {
     console.error('Azure OpenAI analysis error:', err);
     const formattedError = formatError(err);
@@ -1363,6 +1685,9 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
       scores365Resp
     );
     const llmAnalysis = await callLLMAnalysis(llmInput);
+    if (llmAnalysis.result?.meta?.decisionAudit) {
+      return attachEventPresentation(llmAnalysis.result, event, lineupsResp);
+    }
     if (isActionableAnalysis(llmAnalysis.result)) return attachEventPresentation(llmAnalysis.result as AnalysisResult, event, lineupsResp);
     llmError = llmAnalysis.error || (isOgolProvider
       ? 'LLM returned no actionable recommendation from OGOL data.'
@@ -1371,9 +1696,9 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
       return attachEventPresentation({
         eventId,
         market: 'none',
-        recommendation: 'sem entrada confiavel',
+        recommendation: 'Nenhuma entrada recomendada para este jogo.',
         confidence: 0,
-        rationale: 'A IA analisou os dados disponiveis do OGOL, mas nao encontrou base esportiva suficiente para recomendar uma entrada sem usar odds ou fallback heuristico.',
+        rationale: 'Os dados disponiveis do OGOL nao atingiram os criterios minimos de qualidade e confirmacao estatistica.',
         analysisSource: 'azure-openai',
         meta: {
           provider: 'ogol',

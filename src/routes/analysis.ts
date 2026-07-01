@@ -28,7 +28,7 @@ type BestDailyResponse = {
   bestEntry: AnalysisResult | null;
   entries: AnalysisResult[];
   analyses: AnalysisResult[];
-  skipped: Array<{ eventId?: string | number; reason: string }>;
+  skipped: Array<{ eventId?: string | number; reason: string; attempts?: number }>;
 };
 
 type TournamentAnalysisResponse = {
@@ -41,7 +41,7 @@ type TournamentAnalysisResponse = {
   bestEntry: AnalysisResult | null;
   entries: AnalysisResult[];
   analyses: AnalysisResult[];
-  skipped: Array<{ eventId?: string | number; reason: string }>;
+  skipped: Array<{ eventId?: string | number; reason: string; attempts?: number }>;
   availableTournaments?: Array<{ ids: string[]; name?: string; count: number; sampleEventId?: string | number }>;
   warning?: string;
 };
@@ -56,8 +56,25 @@ type FullDailyAnalysisResponse = {
   bestEntry: AnalysisResult | null;
   entries: Array<AnalysisResult & { dataProfile?: MatchDataProfile }>;
   analyses: Array<AnalysisResult & { dataProfile?: MatchDataProfile }>;
-  skipped: Array<{ eventId?: string | number; reason: string; dataProfile?: MatchDataProfile }>;
+  skipped: Array<{ eventId?: string | number; reason: string; attempts?: number; dataProfile?: MatchDataProfile }>;
   warning?: string;
+};
+
+type CachedAnalysis = {
+  expiresAt: number;
+  value: AnalysisResult;
+};
+
+type CachedFullDaily = {
+  expiresAt: number;
+  value: FullDailyAnalysisResponse;
+};
+
+type AnalyzeConcurrencyConfig = {
+  concurrency: number;
+  timeoutMs: number;
+  retries: number;
+  cacheTtlMs: number;
 };
 
 type MatchDataProfile = {
@@ -91,6 +108,13 @@ type MatchDataProfile = {
   historySource?: string;
 };
 
+const analysisEventCache = new Map<string, CachedAnalysis>();
+const fullDailyCache = new Map<string, CachedFullDaily>();
+const profileCache = new Map<string, { expiresAt: number; value: MatchDataProfile }>();
+const profileInFlight = new Map<string, Promise<MatchDataProfile>>();
+const MAX_ANALYSIS_EVENT_CACHE_ITEMS = 500;
+const MAX_FULL_DAILY_CACHE_ITEMS = 80;
+
 function parseEventIds(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value.flatMap((item) => parseEventIds(item));
@@ -118,7 +142,18 @@ function selectBestEventEntry(analyses: AnalysisResult[]): BestOfThreeResponse {
 }
 
 async function analyzeBestOfThree(eventIds: string[], options: AnalyzeOptions): Promise<BestOfThreeResponse> {
-  const analyses = await Promise.all(eventIds.map((eventId) => analyzeEvent(eventId, options)));
+  const concurrency = Math.max(1, Number(process.env.ANALYSIS_CONCURRENCY || 1));
+  const { analyses, skipped } = await analyzeWithConcurrency(
+    eventIds,
+    options,
+    concurrency,
+    Number(process.env.ANALYSIS_TIMEOUT_MS || 180000),
+    Number(process.env.ANALYSIS_RETRIES || 1),
+    Number(process.env.ANALYSIS_CACHE_TTL_MS || 15 * 60 * 1000),
+  );
+  if (analyses.length === 0) {
+    throw new Error(skipped.map((item) => `${item.eventId}: ${item.reason}`).join('; ') || 'Nenhuma analise foi concluida.');
+  }
   return selectBestEventEntry(analyses);
 }
 
@@ -385,19 +420,89 @@ async function inspectMatchData(eventId: string, event?: any): Promise<MatchData
   };
 }
 
-async function inspectProfilesWithConcurrency(events: any[], concurrency = 2) {
+function inspectMatchDataCached(eventId: string, event?: any): Promise<MatchDataProfile> {
+  const key = `${process.env.SCORES_PROVIDER || 'sofascore'}:${eventId}`;
+  const cached = profileCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.value);
+  if (cached) profileCache.delete(key);
+
+  const running = profileInFlight.get(key);
+  if (running) return running;
+
+  const promise = inspectMatchData(eventId, event)
+    .then((profile) => {
+      const configuredTtl = Number(process.env.PROFILE_INSPECTION_CACHE_TTL_MS || 15 * 60 * 1000);
+      const ttlMs = profile.score > 0 ? configuredTtl : Math.min(configuredTtl, 60 * 1000);
+      profileCache.set(key, { expiresAt: Date.now() + Math.max(1000, ttlMs), value: profile });
+      pruneCache(profileCache, 500);
+      return profile;
+    })
+    .finally(() => profileInFlight.delete(key));
+  profileInFlight.set(key, promise);
+  return promise;
+}
+
+function buildFailedProfile(eventId: string, reason: string): MatchDataProfile {
+  return {
+    eventId,
+    score: 0,
+    hasStatistics: false,
+    statisticsItems: 0,
+    hasLineupsOrPlayers: false,
+    lineupPlayers: 0,
+    hasRecentHistory: false,
+    recentMatches: 0,
+    hasIncidents: false,
+    incidentsApplicable: true,
+    incidents: 0,
+    hasCardsData: false,
+    hasCornersData: false,
+    missing: ['profile_inspection'],
+    dataSources: [process.env.SCORES_PROVIDER || 'sofascore'],
+    scores365Attempted: false,
+    scores365Matched: false,
+    scores365Reason: reason,
+    historySource: 'unavailable',
+  };
+}
+
+async function inspectProfilesWithConcurrency(events: any[], concurrency = 2, timeoutMs = 0, totalBudgetMs = 0) {
   const profiles: Array<{ event: any; profile: MatchDataProfile }> = [];
   let index = 0;
+  const deadline = totalBudgetMs > 0 ? Date.now() + totalBudgetMs : 0;
 
   async function worker() {
     while (index < events.length) {
       const currentIndex = index;
       index += 1;
       const event = events[currentIndex];
-      profiles[currentIndex] = {
-        event,
-        profile: await inspectMatchData(String(event.id), event),
-      };
+      const eventId = String(event.id);
+      const remainingMs = deadline ? deadline - Date.now() : timeoutMs;
+      if (deadline && remainingMs <= 0) {
+        profiles[currentIndex] = {
+          event,
+          profile: buildFailedProfile(eventId, `Profile inspection budget of ${totalBudgetMs}ms exhausted`),
+        };
+        continue;
+      }
+
+      try {
+        profiles[currentIndex] = {
+          event,
+          profile: await withTimeout(
+            inspectMatchDataCached(eventId, event),
+            deadline && timeoutMs > 0 ? Math.min(timeoutMs, remainingMs) : timeoutMs,
+            `Profile inspection ${eventId}`
+          ),
+        };
+      } catch (err) {
+        const reason = formatAttemptError(err);
+        console.warn(`Inspecao de perfil falhou para o evento ${eventId}: ${reason}`);
+        profiles[currentIndex] = {
+          event,
+          profile: buildFailedProfile(eventId, reason),
+        };
+      }
     }
   }
 
@@ -449,10 +554,136 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
-async function analyzeWithConcurrency(eventIds: string[], options: AnalyzeOptions, concurrency = 2, timeoutMs = 0) {
+function pruneCache<K, V>(cache: Map<K, V>, maxItems: number) {
+  while (cache.size > maxItems) {
+    const firstKey = cache.keys().next().value;
+    if (firstKey === undefined) break;
+    cache.delete(firstKey);
+  }
+}
+
+function analysisCacheKey(eventId: string | number, options: AnalyzeOptions) {
+  return JSON.stringify({
+    eventId: String(eventId),
+    useLLM: options.useLLM !== false,
+    includeOdds: Boolean(options.includeOdds),
+    useOddsFallback: Boolean(options.useOddsFallback),
+    includeEnrichment: options.includeEnrichment !== false,
+    provider: process.env.SCORES_PROVIDER || 'sofascore',
+  });
+}
+
+function getCachedAnalysis(eventId: string | number, options: AnalyzeOptions) {
+  const cacheKey = analysisCacheKey(eventId, options);
+  const cached = analysisEventCache.get(cacheKey);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    analysisEventCache.delete(cacheKey);
+    return null;
+  }
+  return cached.value;
+}
+
+function setCachedAnalysis(eventId: string | number, options: AnalyzeOptions, value: AnalysisResult, ttlMs: number) {
+  if (!ttlMs || ttlMs <= 0) return;
+  analysisEventCache.set(analysisCacheKey(eventId, options), {
+    expiresAt: Date.now() + ttlMs,
+    value,
+  });
+  pruneCache(analysisEventCache, MAX_ANALYSIS_EVENT_CACHE_ITEMS);
+}
+
+function fullDailyCacheKey(date: string, options: AnalyzeOptions, config: Record<string, unknown>) {
+  return JSON.stringify({
+    date,
+    options: {
+      useLLM: options.useLLM !== false,
+      includeOdds: Boolean(options.includeOdds),
+      useOddsFallback: Boolean(options.useOddsFallback),
+      includeEnrichment: options.includeEnrichment !== false,
+    },
+    config,
+    provider: process.env.SCORES_PROVIDER || 'sofascore',
+  });
+}
+
+function getCachedFullDaily(cacheKey: string) {
+  const cached = fullDailyCache.get(cacheKey);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    fullDailyCache.delete(cacheKey);
+    return null;
+  }
+  return cached.value;
+}
+
+function setCachedFullDaily(cacheKey: string, value: FullDailyAnalysisResponse, ttlMs: number) {
+  if (!ttlMs || ttlMs <= 0) return;
+  fullDailyCache.set(cacheKey, {
+    expiresAt: Date.now() + ttlMs,
+    value,
+  });
+  pruneCache(fullDailyCache, MAX_FULL_DAILY_CACHE_ITEMS);
+}
+
+function formatAttemptError(err: unknown) {
+  return err instanceof Error ? err.message : String(err);
+}
+
+async function analyzeEventResilient(eventId: string, options: AnalyzeOptions, config: AnalyzeConcurrencyConfig) {
+  const cached = getCachedAnalysis(eventId, options);
+  if (cached) {
+    return { analysis: { ...cached, meta: { ...(cached.meta || {}), cacheHit: true } }, attempts: 0 };
+  }
+
+  let lastError = 'Analysis failed';
+  const maxAttempts = Math.max(1, config.retries + 1);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const analysis = await withTimeout(
+        analyzeEvent(eventId, options),
+        config.timeoutMs,
+        `Analysis ${eventId}`
+      );
+
+      if (analysis?.recommendation && Number(analysis.confidence || 0) > 0) {
+        setCachedAnalysis(eventId, options, analysis, config.cacheTtlMs);
+        return { analysis, attempts: attempt };
+      }
+
+      return {
+        skipped: {
+          eventId,
+          reason: 'Analysis returned no usable recommendation',
+          attempts: attempt,
+        },
+      };
+    } catch (err) {
+      lastError = formatAttemptError(err);
+      console.warn(`Analise individual falhou para o evento ${eventId} (tentativa ${attempt}/${maxAttempts}): ${lastError}`);
+    }
+  }
+
+  return {
+    skipped: {
+      eventId,
+      reason: lastError,
+      attempts: maxAttempts,
+    },
+  };
+}
+
+async function analyzeWithConcurrency(eventIds: string[], options: AnalyzeOptions, concurrency = 2, timeoutMs = 0, retries = 0, cacheTtlMs = 0) {
   const analyses: AnalysisResult[] = [];
-  const skipped: Array<{ eventId?: string | number; reason: string }> = [];
+  const skipped: Array<{ eventId?: string | number; reason: string; attempts?: number }> = [];
   let index = 0;
+  const config = {
+    concurrency: Math.max(1, concurrency),
+    timeoutMs,
+    retries: Math.max(0, retries),
+    cacheTtlMs,
+  };
 
   async function worker() {
     while (index < eventIds.length) {
@@ -460,24 +691,13 @@ async function analyzeWithConcurrency(eventIds: string[], options: AnalyzeOption
       index += 1;
       const eventId = eventIds[currentIndex];
 
-      try {
-        const analysis = await withTimeout(
-          analyzeEvent(eventId, options),
-          timeoutMs,
-          `Analysis ${eventId}`
-        );
-        if (analysis?.recommendation && analysis.confidence > 0) {
-          analyses.push(analysis);
-        } else {
-          skipped.push({ eventId, reason: 'Analysis returned no usable recommendation' });
-        }
-      } catch (err) {
-        skipped.push({ eventId, reason: err instanceof Error ? err.message : String(err) });
-      }
+      const result = await analyzeEventResilient(eventId, options, config);
+      if (result.analysis) analyses.push(result.analysis);
+      if (result.skipped) skipped.push(result.skipped);
     }
   }
 
-  await Promise.all(Array.from({ length: Math.max(1, concurrency) }, () => worker()));
+  await Promise.all(Array.from({ length: config.concurrency }, () => worker()));
   return { analyses, skipped };
 }
 
@@ -506,7 +726,18 @@ async function analyzeBestDaily(date: string, options: AnalyzeOptions, config: {
   };
 }
 
-async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: { limit: number; maxCandidates: number; mode: string; strictMarkets: boolean; strictFull: boolean }): Promise<FullDailyAnalysisResponse> {
+async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: { limit: number; maxCandidates: number; mode: string; strictMarkets: boolean; strictFull: boolean; analysisConcurrency: number; analysisTimeoutMs: number; analysisRetries: number; analysisCacheTtlMs: number; fullDailyCacheTtlMs: number; profileTimeoutMs: number; profileBudgetMs: number }): Promise<FullDailyAnalysisResponse> {
+  const cacheKey = fullDailyCacheKey(date, options, config);
+  const cached = getCachedFullDaily(cacheKey);
+  if (cached) {
+    return {
+      ...cached,
+      warning: cached.warning
+        ? `${cached.warning} Resultado servido do cache.`
+        : 'Resultado servido do cache.',
+    };
+  }
+
   const matchesResponse: any = await fetchMatchesForAnalysisDay(date, config.mode);
   const events = Array.isArray(matchesResponse?.events)
     ? matchesResponse.events
@@ -516,12 +747,14 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
   const matches = filterMatchesForMode(events, config.mode);
   const candidateEvents = matches.slice(0, config.maxCandidates);
   const ogolConcurrency = Math.max(1, Number(process.env.OGOL_ANALYSIS_CONCURRENCY || 1));
-  const concurrency = process.env.SCORES_PROVIDER === 'ogol' ? ogolConcurrency : 2;
-  const profiles = await inspectProfilesWithConcurrency(candidateEvents, concurrency);
+  const providerConcurrency = process.env.SCORES_PROVIDER === 'ogol' ? ogolConcurrency : 2;
+  const concurrency = Math.max(1, Math.min(config.analysisConcurrency, providerConcurrency));
+  const profiles = await inspectProfilesWithConcurrency(candidateEvents, concurrency, config.profileTimeoutMs, config.profileBudgetMs);
   const qualified = profiles
     .filter((item) => isFullDataProfile(item.profile, config.strictMarkets))
     .sort((a, b) => b.profile.score - a.profile.score || eventCompletenessScore(b.event) - eventCompletenessScore(a.event));
-  const rankedProfiles = [...profiles]
+  const rankedProfiles = profiles
+    .filter((item) => item.profile.score > 0 && !item.profile.missing.includes('profile_inspection'))
     .sort((a, b) => b.profile.score - a.profile.score || eventCompletenessScore(b.event) - eventCompletenessScore(a.event));
   const selected = config.strictFull
     ? qualified.slice(0, config.limit)
@@ -530,7 +763,14 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
       ...rankedProfiles.filter((item) => !qualified.some((qualifiedItem) => String(qualifiedItem.event.id) === String(item.event.id))),
     ].slice(0, config.limit);
   const eventIds = selected.map((item) => String(item.event.id));
-  const { analyses, skipped } = await analyzeWithConcurrency(eventIds, options, concurrency);
+  const { analyses, skipped } = await analyzeWithConcurrency(
+    eventIds,
+    options,
+    concurrency,
+    config.analysisTimeoutMs,
+    config.analysisRetries,
+    config.analysisCacheTtlMs
+  );
   const profileById = new Map(selected.map((item) => [String(item.event.id), item.profile]));
   const analysesWithProfiles = analyses
     .map((analysis) => ({
@@ -558,7 +798,7 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
       : `Nao havia ${config.limit} partidas 100% completas. A rota retornou as ${entries.length} partidas com mais dados reais disponiveis e informa os campos ausentes em dataProfile.missing.`
     : undefined;
 
-  return {
+  const result = {
     date,
     requestedMatches: config.limit,
     matchesFound: matches.length,
@@ -571,6 +811,8 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
     skipped: skippedByProfile,
     warning,
   };
+  setCachedFullDaily(cacheKey, result, config.fullDailyCacheTtlMs);
+  return result;
 }
 
 async function analyzeTournament(tournamentId: string, options: AnalyzeOptions, config: { date: string; limit: number; maxCandidates: number; mode: string; daysAhead: number; analysisConcurrency: number; analysisTimeoutMs: number }): Promise<TournamentAnalysisResponse> {
@@ -897,12 +1139,66 @@ analysisRouter.get('/analysis/full-daily', async (req, res) => {
       : 'prelive';
     const strictMarkets = isTrue(req.query.strictMarkets);
     const strictFull = isTrue(req.query.strictFull);
+    const defaultConcurrency = process.env.SCORES_PROVIDER === 'ogol'
+      ? parsePositiveInt(process.env.OGOL_ANALYSIS_CONCURRENCY, 1, 1, 4)
+      : 2;
+    const analysisConcurrency = parsePositiveInt(req.query.analysisConcurrency, defaultConcurrency, 1, 4);
+    const analysisTimeoutMs = parsePositiveInt(
+      req.query.analysisTimeoutMs,
+      Number(process.env.FULL_DAILY_ANALYSIS_TIMEOUT_MS || 120000),
+      10000,
+      180000
+    );
+    const analysisRetries = parsePositiveInt(
+      req.query.analysisRetries,
+      Number(process.env.FULL_DAILY_ANALYSIS_RETRIES || 0),
+      0,
+      3
+    );
+    const analysisCacheTtlMs = parsePositiveInt(
+      req.query.analysisCacheTtlMs,
+      Number(process.env.FULL_DAILY_ANALYSIS_CACHE_TTL_MS || 900000),
+      0,
+      86400000
+    );
+    const fullDailyCacheTtlMs = parsePositiveInt(
+      req.query.fullDailyCacheTtlMs,
+      Number(process.env.FULL_DAILY_RESPONSE_CACHE_TTL_MS || 300000),
+      0,
+      86400000
+    );
+    const profileTimeoutMs = parsePositiveInt(
+      req.query.profileTimeoutMs,
+      Number(process.env.FULL_DAILY_PROFILE_TIMEOUT_MS || 120000),
+      5000,
+      120000
+    );
+    const profileBudgetMs = parsePositiveInt(
+      req.query.profileBudgetMs,
+      Number(process.env.FULL_DAILY_PROFILE_BUDGET_MS || 180000),
+      30000,
+      300000
+    );
 
     const result = await analyzeFullDaily(date, {
       useLLM: req.query.useLLM !== 'false',
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
-    }, { limit, maxCandidates, mode, strictMarkets, strictFull });
+      includeEnrichment: req.query.includeEnrichment !== 'false',
+    }, {
+      limit,
+      maxCandidates,
+      mode,
+      strictMarkets,
+      strictFull,
+      analysisConcurrency,
+      analysisTimeoutMs,
+      analysisRetries,
+      analysisCacheTtlMs,
+      fullDailyCacheTtlMs,
+      profileTimeoutMs,
+      profileBudgetMs,
+    });
 
     res.json({ ok: true, result });
   } catch (err) {

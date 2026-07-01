@@ -1,22 +1,19 @@
-import { chromium, type Browser, type Page } from 'playwright';
+import type { Page } from 'playwright';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { NormalizedEvent } from '../types/event';
 import type { EventLive } from '../types/event.live';
-
-const BASE_URL = (process.env.OGOL_BASE_URL || 'https://www.ogol.com.br').replace(/\/+$/, '');
-const AGENDA_URL = process.env.OGOL_AGENDA_URL || `${BASE_URL}/agenda.php`;
-const REQUEST_TIMEOUT_MS = Number(process.env.OGOL_REQUEST_TIMEOUT_MS || 30000);
-const CACHE_TTL_MS = Number(process.env.OGOL_CACHE_TTL_MS || 10 * 60 * 1000);
-const MATCH_LIMIT = Number(process.env.OGOL_MATCH_LIMIT || 30);
-const EVENT_LOOKAHEAD_DAYS = Math.max(1, Number(process.env.OGOL_EVENT_LOOKAHEAD_DAYS || 7));
-const DISK_CACHE_PATH = process.env.OGOL_DISK_CACHE_PATH || path.join('C:\\tmp', 'placarpro-ogol-matches.json');
-const OGOL_PROXY_URL = process.env.OGOL_PROXY_URL || '';
-const OGOL_PROXY_USERNAME = process.env.OGOL_PROXY_USERNAME || '';
-const OGOL_PROXY_PASSWORD = process.env.OGOL_PROXY_PASSWORD || '';
-const OGOL_HEADLESS = process.env.OGOL_HEADLESS !== 'false';
-const USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+import { loadOgolPage as loadPageText, withOgolPage as withPage } from './ogol/browser';
+import {
+  OGOL_AGENDA_URL as AGENDA_URL,
+  OGOL_BASE_URL as BASE_URL,
+  OGOL_CACHE_TTL_MS as CACHE_TTL_MS,
+  OGOL_DISK_CACHE_PATH as DISK_CACHE_PATH,
+  OGOL_EVENT_LOOKAHEAD_DAYS as EVENT_LOOKAHEAD_DAYS,
+  OGOL_MATCH_LIMIT as MATCH_LIMIT,
+  OGOL_REQUEST_TIMEOUT_MS as REQUEST_TIMEOUT_MS,
+} from './ogol/config';
+import { fetchOgolDeepData } from './ogol/deep';
 
 type OgolMatch = {
   id: number;
@@ -70,6 +67,20 @@ type OgolTeamProfile = {
   text: string;
   players: OgolEntityLink[];
   imageUrl?: string;
+  teamName?: string;
+  matches: OgolHistoricalMatch[];
+};
+
+type OgolHistoricalMatch = {
+  id: number;
+  url: string;
+  date?: string;
+  homeTeam: { id: number; name: string };
+  awayTeam: { id: number; name: string };
+  homeScore: number;
+  awayScore: number;
+  subjectSide: 'home' | 'away';
+  sourceText: string;
 };
 
 const matchCache = new Map<string, { expiresAt: number; promise: Promise<{ status: number; events: EventLive[]; raw: any }> }>();
@@ -135,7 +146,7 @@ function escapeRegExp(value: string) {
 }
 
 function toNumber(value: unknown) {
-  const parsed = Number(String(value ?? '').replace(',', '.').replace(/\s+/g, ''));
+  const parsed = Number(String(value ?? '').replace(',', '.').replace(/[%\s]+/g, ''));
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
@@ -357,48 +368,6 @@ function toNormalizedEvent(details: OgolEventDetails): NormalizedEvent {
   };
 }
 
-async function withPage<T>(handler: (page: Page) => Promise<T>) {
-  let browser: Browser | null = null;
-  try {
-    browser = await chromium.launch({
-      headless: OGOL_HEADLESS,
-      proxy: OGOL_PROXY_URL
-        ? {
-          server: OGOL_PROXY_URL,
-          username: OGOL_PROXY_USERNAME || undefined,
-          password: OGOL_PROXY_PASSWORD || undefined,
-        }
-        : undefined,
-    });
-    const context = await browser.newContext({
-      userAgent: USER_AGENT,
-      locale: 'pt-BR',
-      timezoneId: process.env.MATCHES_TIMEZONE || 'America/Sao_Paulo',
-      viewport: { width: 1365, height: 768 },
-      extraHTTPHeaders: {
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
-      },
-    });
-    const page = await context.newPage();
-    return await handler(page);
-  } finally {
-    if (browser) await browser.close();
-  }
-}
-
-async function loadPageText(page: Page, url: string) {
-  const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: REQUEST_TIMEOUT_MS });
-  if (!response?.ok()) {
-    throw new Error(`OGOL HTTP ${response?.status() || 'no-response'} for ${url}`);
-  }
-  await page.waitForTimeout(500);
-  const bodyText = await page.locator('body').innerText().catch(() => '');
-  if (/sorry, you have been blocked|unable to access ogol/i.test(bodyText)) {
-    throw new Error(`OGOL blocked the automated request for ${url}`);
-  }
-}
-
 function buildAgendaUrls(date?: string) {
   if (!date) return [`${BASE_URL}/jogos/hoje`, `${BASE_URL}/jogos`, AGENDA_URL, BASE_URL];
   const compact = date.replace(/-/g, '');
@@ -428,6 +397,13 @@ function parseTeamsFromText(text: string) {
   }
 
   return null;
+}
+
+function cleanHistoricalTeamName(value: string) {
+  return String(value || '')
+    .replace(/^[VED]\s+\d{1,2}[/.]\d{1,2}(?:[/.]\d{2,4})?\s+\d{1,2}:\d{2}\s+\S+\s+/i, '')
+    .replace(/^\d{1,2}[/.]\d{1,2}(?:[/.]\d{2,4})?\s+\d{1,2}:\d{2}\s+\S+\s+/i, '')
+    .trim();
 }
 
 function parseTeamsFromDetails(title?: string, h1Text?: string) {
@@ -775,6 +751,10 @@ function parseSeasonFacts(section: string) {
     goalsAgainst: toNumber(text.match(/(\d+)\s*Gols Sofridos/i)?.[1]),
     goalsPerGame: toNumber(text.match(/([\d.,]+)\s+G\/J/i)?.[1]),
     form: text.match(/FORMA\s+([A-Z]+)/i)?.[1],
+    cleanSheets: toNumber(text.match(/(\d+)\s+(?:clean sheets|jogos sem sofrer gol)/i)?.[1]),
+    failedToScore: toNumber(text.match(/(\d+)\s+(?:jogos sem marcar|sem marcar)/i)?.[1]),
+    winningStreak: toNumber(text.match(/(\d+)\s+(?:vitorias consecutivas|jogos vencendo)/i)?.[1]),
+    winlessStreak: toNumber(text.match(/(\d+)\s+(?:jogos sem vencer|sem vitoria)/i)?.[1]),
   };
 }
 
@@ -1263,15 +1243,25 @@ export async function fetchOgolEvent(eventId: number | string) {
       },
     };
   }
+  const richData = await fetchOgolDeepData(
+    eventId,
+    details.match.url,
+    details.match.homeTeam,
+    details.match.awayTeam,
+  );
   return {
     status: 200,
-    data: toNormalizedEvent(details),
+    data: {
+      ...toNormalizedEvent(details),
+      richData,
+    },
     raw: {
       source: 'ogol',
       url: details.match.url,
       title: details.title,
       match: details.match,
       context: details.context || buildOgolContext(details),
+      richData,
     },
   };
 }
@@ -1299,6 +1289,45 @@ function extractPairStat(text: string, label: string, patterns: RegExp[]) {
   return null;
 }
 
+export function deepStatisticItems(richData: any) {
+  const match = richData?.analysisReady?.match;
+  const candidates: Array<{ label: string; home: string; away: string }> = [];
+  for (const table of match?.tables || []) {
+    const rows = table?.rows || [];
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index];
+      const label = row.find((cell: string) => /[a-zA-ZÀ-ÿ]/.test(cell) && !/^\d+[.,]?\d*%?$/.test(cell));
+      const values = row.filter((cell: string) => /^-?\d+(?:[.,]\d+)?%?$/.test(cell));
+      if (label && values.length >= 2) candidates.push({ label, home: values[0], away: values[1] });
+
+      const valueRow = rows[index + 1];
+      if (!valueRow || row.length !== valueRow.length || !row.every((cell: string) => /[a-zA-Z]/.test(normalizeText(cell)))) continue;
+      row.forEach((columnLabel: string, columnIndex: number) => {
+        const valueText = String(valueRow[columnIndex] || '');
+        const shotValues = valueText.match(/^\s*\((-?\d+(?:[.,]\d+)?)\)\s*(-?\d+(?:[.,]\d+)?)\s+(-?\d+(?:[.,]\d+)?)\s*\((-?\d+(?:[.,]\d+)?)\)\s*$/);
+        if (shotValues) {
+          candidates.push({ label: columnLabel, home: shotValues[2], away: shotValues[3] });
+          if (/chute|finaliza/.test(normalizeText(columnLabel))) {
+            candidates.push({ label: 'Chutes no alvo', home: shotValues[1], away: shotValues[4] });
+          }
+          return;
+        }
+        const pair = valueText.match(/-?\d+(?:[.,]\d+)?%?/g) || [];
+        if (pair.length >= 2) candidates.push({ label: columnLabel, home: pair[0], away: pair[1] });
+      });
+    }
+  }
+  for (const block of match?.statistics || []) {
+    if (block?.label && Array.isArray(block.values) && block.values.length >= 2 && block.values.length <= 4) {
+      candidates.push({ label: block.label, home: block.values[0], away: block.values[1] });
+    }
+  }
+  const statisticName = /posse|chute|finaliza|escanteio|gols? esperados?|\bxg\b|passe|falta|impedimento|desarme|recupera|cruzamento|duelo|defesa|intercepta|lancamento|bola longa|pressao|intensidade|eficiencia|cartao|amarelo|vermelho|dividida/;
+  return [...new Map(candidates.map((item) => [normalizeText(item.label), item])).values()]
+    .filter((item) => statisticName.test(normalizeText(item.label)) && !/^\d/.test(item.label))
+    .map((item) => createStatItem(`ogol-deep-${toSlug(item.label)}`, item.label, item.home, item.away));
+}
+
 function teamProfileMetric(profile: OgolTeamProfile, labels: string[]) {
   const sections = extractKnownSections(profile.text);
   const statisticsText = sectionByName(sections, /ESTAT/i);
@@ -1316,6 +1345,7 @@ function teamProfileMetric(profile: OgolTeamProfile, labels: string[]) {
 export async function fetchOgolStatistics(eventId: number | string) {
   const details = await loadOgolDetailsOrAgenda(eventId).catch(() => null);
   if (!details) return null;
+  const richData = await fetchOgolDeepData(eventId, details.match.url, details.match.homeTeam, details.match.awayTeam);
 
   const text = details.text.replace(/\s+/g, ' ');
   const context = (details.context || buildOgolContext(details)) as any;
@@ -1330,11 +1360,17 @@ export async function fetchOgolStatistics(eventId: number | string) {
     extractPairStat(text, 'Gols sofridos', [/(\d+)\s+Gols sofridos\s+(\d+)/i]),
     extractPairStat(text, 'Media de gols', [/([\d.,]+)\s+M[eé]dia de gols\s+([\d.,]+)/i]),
     extractPairStat(text, 'Gols esperados por jogo', [/([\d.,]+)\s+Gols esperados por jogo\s+([\d.,]+)/i]),
+    extractPairStat(text, 'xGA por jogo', [/([\d.,]+)\s+(?:xGA|Gols esperados contra) por jogo\s+([\d.,]+)/i]),
     extractPairStat(text, 'Chutes por jogo', [/([\d.,]+)\s+Chutes por jogo\s+([\d.,]+)/i]),
+    extractPairStat(text, 'Chutes no alvo por jogo', [/([\d.,]+)\s+(?:Chutes|Finalizacoes) no alvo por jogo\s+([\d.,]+)/i]),
+    extractPairStat(text, 'Posse de bola', [/([\d.,]+)%?\s+Posse de bola\s+([\d.,]+)%?/i]),
     extractPairStat(text, 'Escanteios por jogo', [/([\d.,]+)\s+Escanteios por jogo\s+([\d.,]+)/i]),
     extractPairStat(text, 'Amarelos', [/(\d+)\s+Amarelos\s+(\d+)/i]),
     extractPairStat(text, 'Vermelhos', [/(\d+)\s+Vermelhos\s+(\d+)/i]),
   ].filter(Boolean);
+  for (const item of deepStatisticItems(richData)) {
+    if (!items.some((current) => normalizeText(current.name) === normalizeText(item.name))) items.push(item);
+  }
   const itemExists = (pattern: RegExp) => items.some((item) => pattern.test(normalizeText(`${item.name} ${item.key}`)));
 
   if (!itemExists(/escanteio|corner/) || !itemExists(/amarelo|vermelho|cartao|falta/)) {
@@ -1349,6 +1385,11 @@ export async function fetchOgolStatistics(eventId: number | string) {
       ['Amarelos', ['Cartões amarelos por jogo', 'Cartões amarelos']],
       ['Vermelhos', ['Cartões vermelhos por jogo', 'Cartões vermelhos']],
       ['Faltas por jogo', ['Faltas por jogo', 'Média de faltas']],
+      ['Posse de bola', ['Posse de bola', 'Media de posse']],
+      ['Chutes por jogo', ['Chutes por jogo', 'Finalizacoes por jogo']],
+      ['Chutes no alvo por jogo', ['Chutes no alvo por jogo', 'Finalizacoes no alvo por jogo']],
+      ['xG por jogo', ['xG por jogo', 'Gols esperados por jogo']],
+      ['xGA por jogo', ['xGA por jogo', 'Gols esperados contra por jogo']],
     ] as Array<[string, string[]]>;
 
     for (const [label, aliases] of profileMetrics) {
@@ -1364,6 +1405,32 @@ export async function fetchOgolStatistics(eventId: number | string) {
       away: { url: awayProfile.url, hasStatisticsSection: Boolean(sectionByName(extractKnownSections(awayProfile.text), /ESTAT/i)) },
     };
   }
+  context.deepCoverage = richData?.coverage;
+  context.deepAnalysis = richData?.analysisReady ? {
+    match: {
+      attendance: richData.analysisReady.match?.attendance,
+      weather: richData.analysisReady.match?.weather,
+      broadcast: richData.analysisReady.match?.broadcast,
+      events: richData.analysisReady.match?.events,
+    },
+    teams: {
+      home: richData.analysisReady.teams?.home ? {
+        coach: richData.analysisReady.teams.home.coach,
+        averageAge: richData.analysisReady.teams.home.averageAge,
+        squadValue: richData.analysisReady.teams.home.squadValue,
+        recent: richData.analysisReady.teams.home.recent,
+      } : undefined,
+      away: richData.analysisReady.teams?.away ? {
+        coach: richData.analysisReady.teams.away.coach,
+        averageAge: richData.analysisReady.teams.away.averageAge,
+        squadValue: richData.analysisReady.teams.away.squadValue,
+        recent: richData.analysisReady.teams.away.recent,
+      } : undefined,
+    },
+    headToHead: richData.analysisReady.headToHead,
+    competition: richData.analysisReady.competition,
+    players: richData.analysisReady.players,
+  } : undefined;
 
   return {
     event_id: eventId,
@@ -1391,11 +1458,13 @@ export async function fetchOgolStatistics(eventId: number | string) {
       total_items: items.length,
       source: 'ogol',
     },
+    richData,
     context,
     raw: {
       url: details.match.url,
       sections: details.sections,
       context,
+      deepCoverage: richData?.coverage,
     },
   };
 }
@@ -1442,15 +1511,19 @@ function playerRowsFromEntities(entities: OgolEntityLink[], sideName: string) {
 }
 
 async function fetchTeamProfile(href?: string): Promise<OgolTeamProfile> {
-  if (!href) return { url: '', text: '', players: [] };
+  if (!href) return { url: '', text: '', players: [], matches: [] };
   const url = absoluteUrl(href);
   const cached = teamSquadCache.get(url);
   if (cached && cached.expiresAt > Date.now()) return cached.promise;
 
   const promise = withPage(async (page) => {
     await loadPageText(page, url);
-    return page.evaluate(() => ({
+    const extractProfilePage = () => page.evaluate(() => ({
       text: document.body.innerText,
+      teamName: (document.querySelector('h1') as HTMLElement | null)?.innerText?.replace(/\s+/g, ' ').trim(),
+      historyUrl: [...document.querySelectorAll<HTMLAnchorElement>('a[href]')]
+        .find((anchor) => /ultimos jogos|últimos jogos|todos os jogos|resultados/i.test(anchor.innerText)
+          && /\/(?:equipe|equipa|time)\/[^/?]+\/(?:todos-os-jogos|resultados)/i.test(anchor.href))?.href,
       imageUrl: (document.querySelector('meta[property="og:image"]') as HTMLMetaElement | null)?.content
         || [...document.querySelectorAll<HTMLImageElement>('img')]
           .map((image) => image.getAttribute('data-src') || image.getAttribute('data-original') || image.currentSrc || image.src)
@@ -1467,16 +1540,104 @@ async function fetchTeamProfile(href?: string): Promise<OgolTeamProfile> {
         })
         .filter((player) => player.name.length > 2)
         .slice(0, 35),
+      matches: [...document.querySelectorAll<HTMLAnchorElement>('a[href*="/jogo/"]')]
+        .map((anchor) => {
+          const container = anchor.closest('tr,li,article,[class*="game"],[class*="match"],div') as HTMLElement | null;
+          const teamNames = container
+            ? [...container.querySelectorAll<HTMLAnchorElement>('a[href]')]
+              .filter((item) => /\/(?:equipe|equipa|time)(?:\/|\.php)/i.test(item.href))
+              .map((item) => item.innerText.replace(/\s+/g, ' ').trim())
+              .filter(Boolean)
+            : [];
+          return {
+            href: anchor.href,
+            text: (container?.innerText || anchor.innerText).replace(/\s+/g, ' ').trim().slice(0, 600),
+            teamNames: [...new Set(teamNames)],
+          };
+        })
+        .filter((match) => match.href && match.text),
     }));
-  }).then((profile) => ({
-    url,
-    text: profile.text,
-    imageUrl: profile.imageUrl ? absoluteUrl(profile.imageUrl) : undefined,
-    players: profile.players.map((player) => ({
-      ...player,
-      name: cleanEntityName(player.name),
-    })),
-  })).catch(() => ({ url, text: '', players: [] }));
+    const primary = await extractProfilePage();
+    let combinedMatches = [...primary.matches];
+    if (primary.matches.length < 10 && primary.historyUrl && primary.historyUrl !== url) {
+      await loadPageText(page, primary.historyUrl);
+      const history = await extractProfilePage();
+      combinedMatches.push(...history.matches);
+    }
+    const canonicalUrl = new URL(url);
+    canonicalUrl.searchParams.delete('edicao_id');
+    if (combinedMatches.length < 10 && canonicalUrl.toString() !== url && canonicalUrl.toString() !== primary.historyUrl) {
+      await loadPageText(page, canonicalUrl.toString());
+      const general = await extractProfilePage();
+      combinedMatches.push(...general.matches);
+    }
+    return { ...primary, matches: combinedMatches };
+  }).then((profile) => {
+    const profilePathParts = new URL(url).pathname.split('/').filter(Boolean);
+    const teamPathIndex = profilePathParts.findIndex((part) => /^(equipe|equipa|time)$/i.test(part));
+    const profileTeamName = teamPathIndex >= 0 && profilePathParts[teamPathIndex + 1]
+      ? decodeURIComponent(profilePathParts[teamPathIndex + 1]).replace(/-/g, ' ')
+      : cleanEntityName(profile.teamName || '');
+    const matches = [...new Map(profile.matches.map((raw) => [parseEventIdFromUrl(raw.href), raw])).entries()]
+      .map(([id, raw]) => {
+        if (!id) return null;
+        const score = raw.text.match(/(\d{1,2})\s*[-x]\s*(\d{1,2})/i);
+        const parsedTeams = parseTeamsFromText(raw.text);
+        const distinctTeams = raw.teamNames.filter((name) => normalizeText(name) !== normalizeText(profileTeamName));
+        let homeName = parsedTeams?.homeTeam;
+        let awayName = parsedTeams?.awayTeam;
+        if ((!homeName || !awayName) && raw.teamNames.length >= 2) [homeName, awayName] = raw.teamNames;
+        if ((!homeName || !awayName) && distinctTeams.length && profileTeamName) {
+          const urlPath = normalizeText(new URL(raw.href).pathname);
+          const subjectSlug = toSlug(profileTeamName);
+          const opponentSlug = toSlug(distinctTeams[0]);
+          const subjectFirst = urlPath.indexOf(`-${subjectSlug}-`) < urlPath.indexOf(`-${opponentSlug}-`);
+          homeName = subjectFirst ? profileTeamName : distinctTeams[0];
+          awayName = subjectFirst ? distinctTeams[0] : profileTeamName;
+        }
+        homeName = cleanHistoricalTeamName(homeName || '');
+        awayName = cleanHistoricalTeamName(awayName || '');
+        const homeScore = parsedTeams?.homeScore ?? (score ? Number(score[1]) : undefined);
+        const awayScore = parsedTeams?.awayScore ?? (score ? Number(score[2]) : undefined);
+        if (!homeName || !awayName || homeScore === undefined || awayScore === undefined) return null;
+        if (profileTeamName
+          && !normalizeText(homeName).includes(normalizeText(profileTeamName))
+          && !normalizeText(awayName).includes(normalizeText(profileTeamName))) return null;
+        const subjectSide = normalizeText(homeName).includes(normalizeText(profileTeamName)) ? 'home' : 'away';
+        const isoDate = raw.href.match(/\/jogo\/(\d{4})-(\d{2})-(\d{2})-/);
+        const dateMatch = raw.text.match(/\b(\d{1,2})[/.](\d{1,2})(?:[/.](\d{2,4}))?\b/);
+        const year = dateMatch?.[3]
+          ? Number(dateMatch[3]) < 100 ? 2000 + Number(dateMatch[3]) : Number(dateMatch[3])
+          : new Date().getFullYear();
+        return {
+          id,
+          url: absoluteUrl(raw.href),
+          date: isoDate
+            ? `${isoDate[1]}-${isoDate[2]}-${isoDate[3]}`
+            : dateMatch ? `${year}-${dateMatch[2].padStart(2, '0')}-${dateMatch[1].padStart(2, '0')}` : undefined,
+          homeTeam: { id: teamId(homeName), name: homeName },
+          awayTeam: { id: teamId(awayName), name: awayName },
+          homeScore,
+          awayScore,
+          subjectSide,
+          sourceText: raw.text,
+        } as OgolHistoricalMatch;
+      })
+      .filter((match): match is OgolHistoricalMatch => Boolean(match))
+      .slice(0, 10);
+
+    return {
+      url,
+      text: profile.text,
+      teamName: profileTeamName,
+      imageUrl: profile.imageUrl ? absoluteUrl(profile.imageUrl) : undefined,
+      players: profile.players.map((player) => ({
+        ...player,
+        name: cleanEntityName(player.name),
+      })),
+      matches,
+    };
+  }).catch(() => ({ url, text: '', players: [], matches: [] }));
 
   teamSquadCache.set(url, { expiresAt: Date.now() + CACHE_TTL_MS, promise });
   return promise;
@@ -1500,6 +1661,7 @@ function playersFromSection(details: OgolEventDetails, section: string, sideName
 export async function fetchOgolLineups(eventId: number | string) {
   const details = await loadOgolDetailsOrAgenda(eventId).catch(() => null);
   if (!details) return { status: 404, raw: { requestedEventId: eventId } };
+  const richData = await fetchOgolDeepData(eventId, details.match.url, details.match.homeTeam, details.match.awayTeam);
 
   const starters = sectionText(details, /ultimos titulares|últimos titulares/i);
   const injuries = sectionText(details, /desfalques/i);
@@ -1528,6 +1690,23 @@ export async function fetchOgolLineups(eventId: number | string) {
         .filter((player) => !homePlayers.some((homePlayer) => homePlayer.player.name === player.player.name));
     }
   }
+  const deepPlayers = Array.isArray(richData?.analysisReady?.players) ? richData.analysisReady.players : [];
+  const enrichPlayers = (players: any[]) => players.map((player) => {
+    const profile = deepPlayers.find((candidate: any) =>
+      normalizeText(candidate.name) === normalizeText(player.player?.name)
+      || normalizeText(candidate.name).includes(normalizeText(player.player?.name))
+    );
+    if (!profile) return player;
+    return {
+      ...player,
+      avgRating: profile.averageRating ?? player.avgRating,
+      age: profile.age ?? player.age,
+      hasStats: true,
+      stats: profile,
+    };
+  });
+  homePlayers = enrichPlayers(homePlayers);
+  awayPlayers = enrichPlayers(awayPlayers);
 
   return {
     status: 200,
@@ -1535,10 +1714,12 @@ export async function fetchOgolLineups(eventId: number | string) {
       url: details.match.url,
       starters,
       injuries,
+      deepCoverage: richData?.coverage,
     },
     data: {
       confirmed: Boolean(homePlayers.length || awayPlayers.length),
       source: 'ogol',
+      playerProfiles: deepPlayers,
       home: {
         team: {
           id: teamId(details.match.homeTeam),
@@ -1566,18 +1747,50 @@ export async function fetchOgolLineups(eventId: number | string) {
 export async function fetchOgolIncidents(eventId: number | string) {
   const details = await loadOgolDetailsOrAgenda(eventId).catch(() => null);
   if (!details) return { status: 404, raw: { requestedEventId: eventId } };
+  const richData = await fetchOgolDeepData(eventId, details.match.url, details.match.homeTeam, details.match.awayTeam);
+  const rawEvents = [...new Map(
+    (richData?.analysisReady?.match?.events || [])
+      .filter((event: any) => {
+        const text = String(event.text || '').trim();
+        const normalized = normalizeText(text);
+        const semanticEvent = /gol|goal|cartao|amarelo|vermelho|substitu|entrou|saiu/.test(normalized);
+        const namedEvent = (normalized.match(/[a-z]{3,}/g) || []).length >= 2;
+        if ((!semanticEvent && !namedEvent) || /melhor rating|classificacoes|estatisticas jogador/.test(normalized)) return false;
+        return text.length <= 180 && /(?:\b\d{1,2}|90\+\d+)\s*['´]/.test(text);
+      })
+      .map((event: any) => [`${event.section || ''}|${event.text}`, event]),
+  ).values()];
+  const incidents = rawEvents.map((event: any, index: number) => {
+    const text = String(event.text || '');
+    const normalized = normalizeText(text);
+    const type = /vermelh/.test(normalized) ? 'red-card'
+      : /amarel|cartao/.test(normalized) || /^q\s*\d/.test(normalized) ? 'yellow-card'
+        : /substit/.test(normalized) || /^r\s*\d/.test(normalized) ? 'substitution'
+          : /\bgol\b|\bgoal\b/.test(normalized) || /^b\s*\d/.test(normalized) ? 'goal'
+            : 'match-event';
+    return {
+      id: `${eventId}-${index}`,
+      time: Number(text.match(/(\d{1,3})\s*['´]/)?.[1]) || undefined,
+      type,
+      text,
+      section: event.section,
+    };
+  });
 
   return {
     status: 200,
     raw: {
       url: details.match.url,
+      deepCoverage: richData?.coverage,
       text: sectionText(details, /resumo|comentarios|comentários/i),
     },
     data: {
       eventId,
       source: 'ogol',
-      incidents: [],
-      note: 'OGOL match page was parsed, but minute-by-minute incidents are not consistently available in the public HTML.',
+      incidents,
+      note: incidents.length
+        ? 'Eventos extraidos das paginas publicas relacionadas ao jogo no OGOL.'
+        : 'OGOL match pages were parsed, but no structured minute-by-minute incidents were found.',
     },
   };
 }
@@ -1585,6 +1798,7 @@ export async function fetchOgolIncidents(eventId: number | string) {
 export async function fetchOgolOdds(eventId: number | string) {
   const details = await loadOgolDetailsOrAgenda(eventId).catch(() => null);
   if (!details) return null;
+  const richData = await fetchOgolDeepData(eventId, details.match.url, details.match.homeTeam, details.match.awayTeam);
 
   const odds = details.match.odds?.length === 3
     ? details.match.odds
@@ -1621,6 +1835,8 @@ export async function fetchOgolOdds(eventId: number | string) {
     raw: {
       url: details.match.url,
       odds,
+      deepOdds: richData?.analysisReady?.match?.odds,
+      deepCoverage: richData?.coverage,
     },
   };
 }
@@ -1628,8 +1844,39 @@ export async function fetchOgolOdds(eventId: number | string) {
 export async function fetchOgolStreaks(eventId: string) {
   const details = await loadOgolDetailsOrAgenda(eventId).catch(() => null);
   if (!details) return { status: 404, raw: { requestedEventId: eventId } };
+  const richData = await fetchOgolDeepData(eventId, details.match.url, details.match.homeTeam, details.match.awayTeam);
   const homeFactsPattern = new RegExp(`fatos\\s+${escapeRegExp(details.match.homeTeam)}`, 'i');
   const awayFactsPattern = new RegExp(`fatos\\s+${escapeRegExp(details.match.awayTeam)}`, 'i');
+  const homeTeamLink = details.entities?.teams.find((team) => team.sideHint === 'home'
+    || normalizeText(team.name).includes(normalizeText(details.match.homeTeam)));
+  const awayTeamLink = details.entities?.teams.find((team) => team.sideHint === 'away'
+    || normalizeText(team.name).includes(normalizeText(details.match.awayTeam)));
+  const [homeProfile, awayProfile] = await Promise.all([
+    fetchTeamProfile(homeTeamLink?.href),
+    fetchTeamProfile(awayTeamLink?.href),
+  ]);
+  const withSubject = (matches: OgolHistoricalMatch[], teamName: string) => matches.map((match) => ({
+    ...match,
+    subjectSide: normalizeText(match.homeTeam.name).includes(normalizeText(teamName)) ? 'home' as const : 'away' as const,
+  }));
+  const homeMatches = withSubject(homeProfile.matches, details.match.homeTeam);
+  const awayMatches = withSubject(awayProfile.matches, details.match.awayTeam);
+  const normalizeDeepMatch = (match: any, subject: string) => ({
+    id: match.id,
+    matchTime: match.date ? Math.floor(Date.parse(`${match.date}T12:00:00Z`) / 1000) : undefined,
+    homeTeam: { id: teamId(match.homeSlug || 'home'), name: String(match.homeSlug || '').replace(/-/g, ' ') },
+    awayTeam: { id: teamId(match.awaySlug || 'away'), name: String(match.awaySlug || '').replace(/-/g, ' ') },
+    homeScore: match.homeScore,
+    awayScore: match.awayScore,
+    subjectSide: normalizeText(match.homeSlug).includes(normalizeText(subject)) ? 'home' : 'away',
+    source: 'ogol-deep',
+  });
+  const deepHomeMatches = (richData?.analysisReady?.teams?.home?.recent?.last20?.matches || [])
+    .map((match: any) => normalizeDeepMatch(match, details.match.homeTeam));
+  const deepAwayMatches = (richData?.analysisReady?.teams?.away?.recent?.last20?.matches || [])
+    .map((match: any) => normalizeDeepMatch(match, details.match.awayTeam));
+  const deepHeadToHead = (richData?.analysisReady?.headToHead?.matches || [])
+    .map((match: any) => normalizeDeepMatch(match, details.match.homeTeam));
 
   return {
     status: 200,
@@ -1637,15 +1884,25 @@ export async function fetchOgolStreaks(eventId: string) {
       url: details.match.url,
       factsHome: sectionText(details, homeFactsPattern),
       factsAway: sectionText(details, awayFactsPattern),
+      homeProfileUrl: homeProfile.url,
+      awayProfileUrl: awayProfile.url,
+      homeMatchesFound: homeMatches.length,
+      awayMatchesFound: awayMatches.length,
+      deepCoverage: richData?.coverage,
       headToHead: sectionText(details, /confrontos|ultimos jogos|últimos jogos/i),
     },
     data: {
       eventId,
       source: 'ogol',
       general: [],
-      head2head: [],
-      home: [],
-      away: [],
+      head2head: deepHeadToHead,
+      home: deepHomeMatches.length > homeMatches.length ? deepHomeMatches : homeMatches,
+      away: deepAwayMatches.length > awayMatches.length ? deepAwayMatches : awayMatches,
+      deepSummary: {
+        home: richData?.analysisReady?.teams?.home?.recent,
+        away: richData?.analysisReady?.teams?.away?.recent,
+        headToHead: richData?.analysisReady?.headToHead,
+      },
       teams: [
         { name: details.match.homeTeam },
         { name: details.match.awayTeam },
