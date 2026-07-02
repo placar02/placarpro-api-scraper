@@ -1,4 +1,4 @@
-import { chromium, type Browser, type Page } from 'playwright';
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import {
   OGOL_HEADLESS,
   OGOL_PROXY_PASSWORD,
@@ -8,20 +8,47 @@ import {
   OGOL_USER_AGENT,
 } from './config';
 
-export async function withOgolPage<T>(handler: (page: Page) => Promise<T>): Promise<T> {
-  let browser: Browser | null = null;
-  try {
-    browser = await chromium.launch({
+let sharedBrowser: Browser | null = null;
+let browserPromise: Promise<Browser> | null = null;
+let activeContexts = 0;
+let idleTimer: NodeJS.Timeout | null = null;
+
+async function getBrowser() {
+  if (sharedBrowser?.isConnected()) return sharedBrowser;
+  if (!browserPromise) {
+    browserPromise = chromium.launch({
       headless: OGOL_HEADLESS,
       proxy: OGOL_PROXY_URL
-        ? {
-          server: OGOL_PROXY_URL,
-          username: OGOL_PROXY_USERNAME || undefined,
-          password: OGOL_PROXY_PASSWORD || undefined,
-        }
+        ? { server: OGOL_PROXY_URL, username: OGOL_PROXY_USERNAME || undefined, password: OGOL_PROXY_PASSWORD || undefined }
         : undefined,
-    });
-    const context = await browser.newContext({
+    }).then((browser) => {
+      sharedBrowser = browser;
+      browser.on('disconnected', () => { sharedBrowser = null; });
+      return browser;
+    }).finally(() => { browserPromise = null; });
+  }
+  return browserPromise;
+}
+
+function scheduleIdleClose() {
+  if (idleTimer) clearTimeout(idleTimer);
+  const delay = Math.max(10_000, Number(process.env.OGOL_BROWSER_IDLE_TIMEOUT_MS || 120_000));
+  idleTimer = setTimeout(() => {
+    if (activeContexts || !sharedBrowser) return;
+    const browser = sharedBrowser;
+    sharedBrowser = null;
+    void browser.close().catch(() => undefined);
+  }, delay);
+  idleTimer.unref();
+}
+
+export async function withOgolPage<T>(handler: (page: Page) => Promise<T>): Promise<T> {
+  let context: BrowserContext | null = null;
+  try {
+    if (idleTimer) clearTimeout(idleTimer);
+    const browser = await getBrowser();
+    activeContexts += 1;
+    context = await browser.newContext({
       userAgent: OGOL_USER_AGENT,
       locale: 'pt-BR',
       timezoneId: process.env.MATCHES_TIMEZONE || 'America/Sao_Paulo',
@@ -34,7 +61,9 @@ export async function withOgolPage<T>(handler: (page: Page) => Promise<T>): Prom
     const page = await context.newPage();
     return await handler(page);
   } finally {
-    if (browser) await browser.close();
+    if (context) await context.close().catch(() => undefined);
+    activeContexts = Math.max(0, activeContexts - 1);
+    scheduleIdleClose();
   }
 }
 

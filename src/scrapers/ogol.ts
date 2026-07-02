@@ -1041,6 +1041,29 @@ export async function fetchOgolMatches(date?: string) {
   return promise;
 }
 
+// Never touches the network. Used by latency-sensitive routes to return a
+// stale-while-revalidate preview while the regular collector refreshes data.
+export async function fetchOgolMatchesFastCached(date?: string) {
+  const disk = await readDiskCache();
+  const matches = Array.isArray(disk?.matches)
+    ? date ? disk.matches.filter((match: OgolMatch) => match.date === date) : disk.matches
+    : [];
+  return {
+    status: matches.length ? 200 : 204,
+    cache: 'disk' as const,
+    raw: { source: 'ogol', stale: true, cachedAt: disk?.cachedAt, matches },
+    events: matches.map(toEventLive),
+  };
+}
+
+// Lightweight event lookup: agenda/cache only. It deliberately skips the match page,
+// related pages and player profiles used by the complete analysis pipeline.
+export async function fetchOgolEventFast(eventId: number | string) {
+  const match = await findMatchById(eventId);
+  if (!match) return null;
+  return toEventLive(match);
+}
+
 async function loadOgolDetails(eventId: number | string): Promise<OgolEventDetails | null> {
   const cached = detailsCache.get(String(eventId));
   if (cached && cached.expiresAt > Date.now()) return cached.promise;

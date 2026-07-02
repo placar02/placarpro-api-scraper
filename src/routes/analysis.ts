@@ -6,10 +6,11 @@ import { fetchLineups } from '../scrapers/lineups';
 import { fetchScheduledMatches } from '../scrapers/scheduled';
 import { fetch365Matches } from '../scrapers/scores365';
 import { fetch365Enrichment } from '../scrapers/scores365-enrichment';
-import { fetchOgolIncidents, fetchOgolLineups, fetchOgolMatches, fetchOgolStatistics, fetchOgolStreaks } from '../scrapers/ogol';
+import { fetchOgolEventFast, fetchOgolIncidents, fetchOgolLineups, fetchOgolMatches, fetchOgolMatchesFastCached, fetchOgolStatistics, fetchOgolStreaks } from '../scrapers/ogol';
 import { fetchStatistics } from '../scrapers/statistics';
 import { fetchStreaks } from '../scrapers/streaks';
 import type { AnalysisResult, AnalyzeOptions } from '../types/analysis';
+import { analysisJobPayload, enqueueAnalysisJob, getAnalysisJob } from '../services/analysis-jobs';
 
 export const analysisRouter = express.Router();
 
@@ -114,6 +115,57 @@ const profileCache = new Map<string, { expiresAt: number; value: MatchDataProfil
 const profileInFlight = new Map<string, Promise<MatchDataProfile>>();
 const MAX_ANALYSIS_EVENT_CACHE_ITEMS = 500;
 const MAX_FULL_DAILY_CACHE_ITEMS = 80;
+
+function quickEventResult(event: any, cached?: AnalysisResult | null): AnalysisResult & Record<string, unknown> {
+  const homeGoals = Number(event?.homeScore?.current ?? event?.score?.home ?? event?.homeScore ?? 0);
+  const awayGoals = Number(event?.awayScore?.current ?? event?.score?.away ?? event?.awayScore ?? 0);
+  return {
+    eventId: event?.id ?? cached?.eventId ?? 'unknown',
+    homeTeam: event?.homeTeam ? { id: event.homeTeam.id, name: event.homeTeam.name, shortName: event.homeTeam.shortName, slug: event.homeTeam.slug, imageUrl: event.homeTeam.imageUrl } : cached?.homeTeam,
+    awayTeam: event?.awayTeam ? { id: event.awayTeam.id, name: event.awayTeam.name, shortName: event.awayTeam.shortName, slug: event.awayTeam.slug, imageUrl: event.awayTeam.imageUrl } : cached?.awayTeam,
+    tournamentName: event?.tournament?.name || event?.tournamentName || cached?.tournamentName,
+    startTimestamp: event?.startTimestamp || event?.startTime || cached?.startTimestamp,
+    market: cached?.market || 'pending',
+    recommendation: cached?.recommendation || 'Análise completa em processamento',
+    confidence: Number(cached?.confidence || 0),
+    rationale: cached?.rationale || 'Os dados essenciais já estão disponíveis; estatísticas avançadas e IA estão sendo processadas em segundo plano.',
+    score: { home: homeGoals, away: awayGoals },
+    goalsScored: { home: homeGoals, away: awayGoals },
+    goalsConceded: { home: awayGoals, away: homeGoals },
+    homeAdvantage: event?.homeTeam?.name || cached?.homeTeam?.name,
+    recentMatches: cached?.meta?.recentMatches || [],
+    analysisStatus: cached ? 'cached' : 'processing',
+    analysisSource: cached?.analysisSource,
+    meta: { ...(cached?.meta || {}), mode: 'fast', cacheHit: Boolean(cached) },
+  };
+}
+
+function quickDailyResult(date: string, events: any[], limit: number) {
+  const entries = events.slice(0, limit).map((event) => quickEventResult(event));
+  return {
+    date,
+    requestedMatches: limit,
+    matchesFound: events.length,
+    candidatesChecked: entries.length,
+    qualifiedMatches: 0,
+    selectedEventIds: entries.map((entry) => String(entry.eventId)),
+    bestEntry: entries[0] || null,
+    entries,
+    analyses: entries,
+    skipped: [],
+    analysisStatus: 'processing',
+    warning: 'Dados essenciais disponíveis. A análise completa está sendo processada em segundo plano.',
+  };
+}
+
+function shouldWait(req: express.Request) {
+  return req.query.wait === 'true' || process.env.ANALYSIS_ASYNC_ENABLED === 'false';
+}
+
+function sendJob(res: express.Response, key: string, quickResult: unknown, task: () => Promise<unknown>) {
+  const job = enqueueAnalysisJob(key, quickResult, task);
+  res.status(202).json(analysisJobPayload(job));
+}
 
 function parseEventIds(value: unknown): string[] {
   if (Array.isArray(value)) {
@@ -566,6 +618,7 @@ function analysisCacheKey(eventId: string | number, options: AnalyzeOptions) {
   return JSON.stringify({
     eventId: String(eventId),
     useLLM: options.useLLM !== false,
+    useLLMExplanation: options.useLLMExplanation !== false,
     includeOdds: Boolean(options.includeOdds),
     useOddsFallback: Boolean(options.useOddsFallback),
     includeEnrichment: options.includeEnrichment !== false,
@@ -701,6 +754,24 @@ async function analyzeWithConcurrency(eventIds: string[], options: AnalyzeOption
   return { analyses, skipped };
 }
 
+async function analyzeBatchWithSingleExplanation(eventIds: string[], options: AnalyzeOptions, concurrency: number, timeoutMs: number, cacheTtlMs = 0) {
+  const batch = await analyzeWithConcurrency(eventIds, { ...options, useLLMExplanation: false }, concurrency, timeoutMs, 0, cacheTtlMs);
+  const ranked = batch.analyses.sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+  const best = ranked.find((analysis) => Number(analysis.confidence || 0) > 0);
+  if (!best || options.useLLM === false || options.useLLMExplanation === false) return { ...batch, analyses: ranked };
+  try {
+    const explained = await withTimeout(
+      analyzeEvent(best.eventId, { ...options, useLLMExplanation: true }),
+      Number(process.env.FULL_DAILY_EXPLANATION_TIMEOUT_MS || 12000),
+      `Explanation ${best.eventId}`,
+    );
+    return { ...batch, analyses: ranked.map((analysis) => String(analysis.eventId) === String(explained.eventId) ? explained : analysis) };
+  } catch (error) {
+    console.warn(`Explicacao do lote ignorada por latencia: ${formatAttemptError(error)}`);
+    return { ...batch, analyses: ranked };
+  }
+}
+
 async function analyzeBestDaily(date: string, options: AnalyzeOptions, config: { limit: number; maxCandidates: number; mode: string }): Promise<BestDailyResponse> {
   const matchesResponse: any = await fetchMatchesForAnalysisDay(date, config.mode);
   const events = Array.isArray(matchesResponse?.events)
@@ -745,7 +816,12 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
       ? matchesResponse.data
       : [];
   const matches = filterMatchesForMode(events, config.mode);
-  const candidateEvents = matches.slice(0, config.maxCandidates);
+  const profileCandidateLimit = process.env.SCORES_PROVIDER === 'ogol'
+    ? Math.max(config.limit, Number(process.env.FULL_DAILY_PROFILE_CANDIDATE_LIMIT || config.limit + 2))
+    : config.maxCandidates;
+  const candidateEvents = [...matches]
+    .sort((a, b) => eventCompletenessScore(b) - eventCompletenessScore(a) || getEventTimestamp(a) - getEventTimestamp(b))
+    .slice(0, Math.min(config.maxCandidates, profileCandidateLimit));
   const ogolConcurrency = Math.max(1, Number(process.env.OGOL_ANALYSIS_CONCURRENCY || 1));
   const providerConcurrency = process.env.SCORES_PROVIDER === 'ogol' ? ogolConcurrency : 2;
   const concurrency = Math.max(1, Math.min(config.analysisConcurrency, providerConcurrency));
@@ -763,14 +839,30 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
       ...rankedProfiles.filter((item) => !qualified.some((qualifiedItem) => String(qualifiedItem.event.id) === String(item.event.id))),
     ].slice(0, config.limit);
   const eventIds = selected.map((item) => String(item.event.id));
-  const { analyses, skipped } = await analyzeWithConcurrency(
+  const { analyses: statisticalAnalyses, skipped } = await analyzeWithConcurrency(
     eventIds,
-    options,
+    { ...options, useLLMExplanation: false },
     concurrency,
     config.analysisTimeoutMs,
     config.analysisRetries,
     config.analysisCacheTtlMs
   );
+  const rankedStatistical = statisticalAnalyses
+    .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+  const bestStatistical = rankedStatistical.find((analysis) => Number(analysis.confidence || 0) > 0);
+  let analyses = rankedStatistical;
+  if (bestStatistical && options.useLLM !== false && options.useLLMExplanation !== false) {
+    try {
+      const explained = await withTimeout(
+        analyzeEvent(bestStatistical.eventId, { ...options, useLLMExplanation: true }),
+        Number(process.env.FULL_DAILY_EXPLANATION_TIMEOUT_MS || 15000),
+        `Explanation ${bestStatistical.eventId}`,
+      );
+      analyses = rankedStatistical.map((analysis) => String(analysis.eventId) === String(explained.eventId) ? explained : analysis);
+    } catch (error) {
+      console.warn(`Explicacao da melhor entrada ignorada por latencia: ${formatAttemptError(error)}`);
+    }
+  }
   const profileById = new Map(selected.map((item) => [String(item.event.id), item.profile]));
   const analysesWithProfiles = analyses
     .map((analysis) => ({
@@ -834,11 +926,11 @@ async function analyzeTournament(tournamentId: string, options: AnalyzeOptions, 
   const tournamentEvents = uniqueEvents.filter((event) => getTournamentIds(event).includes(String(tournamentId)));
   const candidates = filterMatchesForMode(tournamentEvents, config.mode).slice(0, config.maxCandidates);
   const eventIds = candidates.map((event) => String(event.id)).filter(Boolean);
-  const { analyses, skipped } = await analyzeWithConcurrency(
+  const { analyses, skipped } = await analyzeBatchWithSingleExplanation(
     eventIds,
     options,
     config.analysisConcurrency,
-    config.analysisTimeoutMs
+    config.analysisTimeoutMs,
   );
   const sorted = analyses.sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
   const entries = sorted.slice(0, config.limit);
@@ -860,6 +952,44 @@ async function analyzeTournament(tournamentId: string, options: AnalyzeOptions, 
     warning: tournamentEvents.length === 0
       ? `Nenhuma partida encontrada para tournamentId=${tournamentId}. Use um dos ids em availableTournaments para a data consultada.`
       : undefined,
+  };
+}
+
+function tournamentName(event: any) {
+  return String(event?.tournament?.name || event?.competition?.name || '').trim();
+}
+
+async function analyzeTournamentByName(name: string, options: AnalyzeOptions, config: { date: string; limit: number; maxCandidates: number; mode: string; daysAhead: number; analysisConcurrency: number; analysisTimeoutMs: number }) {
+  const datesChecked = Array.from({ length: config.daysAhead + 1 }, (_, index) => addDays(config.date, index));
+  const allEvents: any[] = [];
+  for (const date of datesChecked) {
+    const response: any = await fetchMatchesForAnalysisDay(date, config.mode);
+    allEvents.push(...(Array.isArray(response?.events) ? response.events : response?.data || []));
+  }
+  const uniqueEvents = [...new Map(allEvents.map((event) => [String(event.id), event])).values()];
+  const tournamentEvents = uniqueEvents
+    .map((event) => ({ event, score: matchNameScore(name, tournamentName(event)) }))
+    .filter((item) => item.score >= 38)
+    .sort((a, b) => b.score - a.score)
+    .map((item) => item.event);
+  const candidates = filterMatchesForMode(tournamentEvents, config.mode).slice(0, config.maxCandidates);
+  const { analyses, skipped } = await analyzeBatchWithSingleExplanation(candidates.map((event) => String(event.id)), options, config.analysisConcurrency, config.analysisTimeoutMs);
+  const sorted = analyses.sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
+  const entries = sorted.slice(0, config.limit);
+  return {
+    tournamentId: getTournamentIds(tournamentEvents[0])[0] || name,
+    tournamentName: tournamentName(tournamentEvents[0]) || name,
+    datesChecked,
+    requestedEntries: config.limit,
+    matchesFound: tournamentEvents.length,
+    candidatesChecked: candidates.length,
+    selectedEventIds: entries.map((analysis) => String(analysis.eventId)),
+    bestEntry: entries[0] || null,
+    entries,
+    analyses: sorted,
+    skipped,
+    availableTournaments: tournamentEvents.length ? undefined : summarizeAvailableTournaments(uniqueEvents),
+    warning: tournamentEvents.length ? undefined : `Nenhuma partida encontrada para o campeonato "${name}" no período consultado.`,
   };
 }
 
@@ -1180,12 +1310,13 @@ analysisRouter.get('/analysis/full-daily', async (req, res) => {
       300000
     );
 
-    const result = await analyzeFullDaily(date, {
+    const options = {
       useLLM: req.query.useLLM !== 'false',
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
       includeEnrichment: req.query.includeEnrichment !== 'false',
-    }, {
+    };
+    const config = {
       limit,
       maxCandidates,
       mode,
@@ -1198,13 +1329,66 @@ analysisRouter.get('/analysis/full-daily', async (req, res) => {
       fullDailyCacheTtlMs,
       profileTimeoutMs,
       profileBudgetMs,
-    });
+    };
 
-    res.json({ ok: true, result });
+    const cacheKey = fullDailyCacheKey(date, options, config);
+    const cached = getCachedFullDaily(cacheKey);
+    if (cached) {
+      res.json({ ok: true, mode: 'complete', cache: true, result: cached });
+      return;
+    }
+    if (!shouldWait(req)) {
+      const matchesResponse: any = process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolMatchesFastCached(date)
+        : { events: [] };
+      const events = filterMatchesForMode(
+        Array.isArray(matchesResponse?.events) ? matchesResponse.events : matchesResponse?.data || [],
+        mode,
+      );
+      sendJob(res, `full-daily:${cacheKey}`, quickDailyResult(date, events, limit), () => analyzeFullDaily(date, options, config));
+      return;
+    }
+
+    const result = await analyzeFullDaily(date, options, config);
+
+    res.json({ ok: true, mode: 'complete', cache: false, result });
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
     console.error('Full daily analysis error', error.stack || error.message);
     res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+analysisRouter.get('/analysis/tournament', async (req, res) => {
+  try {
+    const name = String(req.query.name || '').trim();
+    if (name.length < 2) {
+      res.status(400).json({ ok: false, error: 'Informe o nome do campeonato.' });
+      return;
+    }
+    const date = typeof req.query.date === 'string' && req.query.date ? req.query.date : getTodayDate();
+    const limit = parsePositiveInt(req.query.limit, 4, 1, 10);
+    const config = {
+      date,
+      limit,
+      maxCandidates: parsePositiveInt(req.query.maxCandidates, Math.max(4, limit), limit, 12),
+      daysAhead: parsePositiveInt(req.query.daysAhead, 2, 0, 14),
+      analysisConcurrency: parsePositiveInt(req.query.analysisConcurrency, 1, 1, 4),
+      analysisTimeoutMs: parsePositiveInt(req.query.analysisTimeoutMs, 90000, 10000, 180000),
+      mode: ['prelive', 'live', 'all'].includes(String(req.query.mode || '').toLowerCase()) ? String(req.query.mode).toLowerCase() : 'prelive',
+    };
+    const options = { useLLM: req.query.useLLM !== 'false', includeOdds: false, useOddsFallback: false, includeEnrichment: isTrue(req.query.includeEnrichment) };
+    if (!shouldWait(req)) {
+      const cached: any = process.env.SCORES_PROVIDER === 'ogol' ? await fetchOgolMatchesFastCached(date) : { events: [] };
+      const events = filterMatchesForMode(cached.events || [], config.mode)
+        .filter((event) => matchNameScore(name, tournamentName(event)) >= 38);
+      const quick = { ...quickDailyResult(date, events, limit), tournamentName: name, datesChecked: [date] };
+      sendJob(res, `tournament-name:${normalizeDataText(name)}:${JSON.stringify(config)}:${analysisCacheKey('all', options)}`, quick, () => analyzeTournamentByName(name, options, config));
+      return;
+    }
+    res.json({ ok: true, result: await analyzeTournamentByName(name, options, config) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
   }
 });
 
@@ -1228,12 +1412,24 @@ analysisRouter.get('/analysis/tournament/:tournamentId', async (req, res) => {
       ? String(req.query.mode).toLowerCase()
       : 'prelive';
 
-    const result = await analyzeTournament(tournamentId, {
+    const options = {
       useLLM: req.query.useLLM !== 'false',
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
       includeEnrichment: isTrue(req.query.includeEnrichment),
-    }, { date, limit, maxCandidates, mode, daysAhead, analysisConcurrency, analysisTimeoutMs });
+    };
+    const config = { date, limit, maxCandidates, mode, daysAhead, analysisConcurrency, analysisTimeoutMs };
+    if (!shouldWait(req)) {
+      const matchesResponse: any = process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolMatchesFastCached(date)
+        : { events: [] };
+      const allEvents = Array.isArray(matchesResponse?.events) ? matchesResponse.events : matchesResponse?.data || [];
+      const events = filterMatchesForMode(allEvents, mode).filter((event) => getTournamentIds(event).includes(tournamentId));
+      const quick = { ...quickDailyResult(date, events, limit), tournamentId, datesChecked: [date] };
+      sendJob(res, `tournament:${tournamentId}:${JSON.stringify(config)}:${analysisCacheKey('all', options)}`, quick, () => analyzeTournament(tournamentId, options, config));
+      return;
+    }
+    const result = await analyzeTournament(tournamentId, options, config);
 
     res.json({ ok: true, result });
   } catch (err) {
@@ -1276,18 +1472,61 @@ analysisRouter.get('/analysis', async (req, res) => {
 // GET /analysis/by-teams?home=Japao&away=Suecia
 analysisRouter.get('/analysis/by-teams', async (req, res) => {
   try {
+    const options = {
+      useLLM: req.query.useLLM !== 'false',
+      includeOdds: isTrue(req.query.includeOdds),
+      useOddsFallback: isTrue(req.query.useOddsFallback),
+      includeEnrichment: req.query.includeEnrichment !== 'false',
+    };
+    if (!shouldWait(req)) {
+      const query = { ...req.query };
+      const date = typeof query.date === 'string' && query.date ? query.date : getTodayDate();
+      const parsedMatch = splitMatchQuery(query.match || query.q);
+      const search = {
+        home: String(query.home || query.homeTeam || parsedMatch.home || '').trim(),
+        away: String(query.away || query.awayTeam || parsedMatch.away || '').trim(),
+        q: String(parsedMatch.q || '').trim(),
+      };
+      if ((!search.home || !search.away) && !search.q) {
+        res.status(400).json({ ok: false, error: 'Informe os dois times da partida.' });
+        return;
+      }
+
+      const cachedMatches: any = process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolMatchesFastCached(date)
+        : { events: [] };
+      const cachedEvent = (cachedMatches.events || [])
+        .map((event: any) => ({ event, score: scoreEventNameMatch(event, search) }))
+        .filter((item: any) => item.score >= 55)
+        .sort((a: any, b: any) => b.score - a.score)[0]?.event;
+      const quick = cachedEvent
+        ? quickEventResult(cachedEvent)
+        : {
+          ...quickEventResult({ id: 'localizando', homeTeam: { name: search.home }, awayTeam: { name: search.away } }),
+          rationale: 'Localizando a partida e preparando a análise completa em segundo plano.',
+        };
+      const jobKey = `teams:${date}:${normalizeDataText(search.home)}:${normalizeDataText(search.away)}:${normalizeDataText(search.q)}:${analysisCacheKey('resolved', options)}`;
+      sendJob(res, jobKey, quick, async () => {
+        const resolved = cachedEvent
+          ? { eventId: String(cachedEvent.id), event: cachedEvent, score: 100, candidates: [] }
+          : await resolveAnalysisEventByTeams({ query } as unknown as express.Request);
+        if ('error' in resolved) throw new Error(resolved.error);
+        return analyzeEvent(resolved.eventId, options);
+      });
+      return;
+    }
+
     const resolved = await resolveAnalysisEventByTeams(req);
     if ('error' in resolved) {
       res.status(resolved.status).json({ ok: false, ...resolved });
       return;
     }
-
-    const result = await analyzeEvent(resolved.eventId, {
-      useLLM: req.query.useLLM !== 'false',
-      includeOdds: isTrue(req.query.includeOdds),
-      useOddsFallback: isTrue(req.query.useOddsFallback),
-      includeEnrichment: req.query.includeEnrichment !== 'false',
-    });
+    const cached = getCachedAnalysis(resolved.eventId, options);
+    if (cached) {
+      res.json({ ok: true, mode: 'complete', cache: true, resolved, result: cached });
+      return;
+    }
+    const result = await analyzeEvent(resolved.eventId, options);
 
     res.json({
       ok: true,
@@ -1330,6 +1569,15 @@ analysisRouter.get('/analysis/:eventId1/:eventId2/:eventId3', async (req, res) =
   }
 });
 
+analysisRouter.get('/analysis/jobs/:jobId', (req, res) => {
+  const job = getAnalysisJob(String(req.params.jobId || ''));
+  if (!job) {
+    res.status(404).json({ ok: false, error: 'Job de análise não encontrado ou expirado.' });
+    return;
+  }
+  res.json(analysisJobPayload(job));
+});
+
 // GET /analysis/:eventId
 // GET /analysis/123,456,789 also works and returns the best entry between 3 events.
 // Use ?useLLM=false only when you want to skip the AI analysis.
@@ -1346,23 +1594,54 @@ analysisRouter.get('/analysis/:eventId', async (req, res) => {
         return;
       }
 
-      const result = await analyzeBestOfThree(eventIds, {
+      const options = {
         useLLM: req.query.useLLM !== 'false',
         includeOdds: isTrue(req.query.includeOdds),
         useOddsFallback: isTrue(req.query.useOddsFallback),
         includeEnrichment: req.query.includeEnrichment !== 'false',
-      });
+      };
+      if (!shouldWait(req)) {
+        const fastEvents = process.env.SCORES_PROVIDER === 'ogol'
+          ? await Promise.all(eventIds.map((id) => fetchOgolEventFast(id).catch(() => null)))
+          : eventIds.map((id) => ({ id }));
+        const entries = fastEvents.map((event, index) => quickEventResult(event || { id: eventIds[index] }));
+        const quickResult = { eventIds, bestEventId: entries[0]?.eventId, bestEntry: entries[0] || null, entries, analyses: entries, analysisStatus: 'processing' };
+        const key = `events:${analysisCacheKey(eventIds.join(','), options)}`;
+        sendJob(res, key, quickResult, () => analyzeBestOfThree(eventIds, options));
+        return;
+      }
+      const result = await analyzeBestOfThree(eventIds, options);
 
       res.json({ ok: true, result });
       return;
     }
 
-    const result = await analyzeEvent(eventId, {
+    const options = {
       useLLM: req.query.useLLM !== 'false',
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
       includeEnrichment: req.query.includeEnrichment !== 'false',
-    });
+    };
+    const cached = getCachedAnalysis(eventId, options);
+    if (cached) {
+      res.json({ ok: true, mode: 'complete', cache: true, result: cached });
+      return;
+    }
+    if (!shouldWait(req)) {
+      const fastEvent = process.env.SCORES_PROVIDER === 'ogol'
+        ? await fetchOgolEventFast(eventId).catch(() => null)
+        : null;
+      const quick = quickEventResult(fastEvent || { id: eventId });
+      sendJob(res, `event:${analysisCacheKey(eventId, options)}`, quick, async () => {
+        const result = await analyzeEvent(eventId, options);
+        if (result?.recommendation && Number(result.confidence || 0) > 0) {
+          setCachedAnalysis(eventId, options, result, Number(process.env.ANALYSIS_CACHE_TTL_MS || 900000));
+        }
+        return result;
+      });
+      return;
+    }
+    const result = await analyzeEvent(eventId, options);
 
     res.json({ ok: true, result });
   } catch (err) {

@@ -58,6 +58,7 @@ export interface AnalysisResult {
 
 export interface AnalyzeOptions {
   useLLM?: boolean;
+  useLLMExplanation?: boolean;
   includeOdds?: boolean;
   useOddsFallback?: boolean;
   includeEnrichment?: boolean;

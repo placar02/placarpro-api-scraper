@@ -379,3 +379,66 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any): 
     meta: { ...(result.meta || {}), decisionAudit: audit },
   };
 }
+
+// Generates market candidates exclusively from structured statistics. The LLM
+// is intentionally not involved in this decision; it only explains the result.
+export function buildStatisticalDecision(input: any, eventId: number | string): AnalysisResult {
+  const recommendations: BettingRecommendation[] = [];
+  const home = input?.teamForm?.homeRecent || {};
+  const away = input?.teamForm?.awayRecent || {};
+  const avgFor = average([finite(home.avgGoalsFor), finite(away.avgGoalsFor)]);
+  const avgAgainst = average([finite(home.avgGoalsAgainst), finite(away.avgGoalsAgainst)]);
+  const over25 = average([finite(home.over25Rate), finite(away.over25Rate)]);
+  const btts = average([finite(home.bttsRate), finite(away.bttsRate)]);
+  const support = [
+    avgFor !== undefined ? `média ofensiva combinada ${avgFor.toFixed(2)}` : null,
+    avgAgainst !== undefined ? `média defensiva combinada ${avgAgainst.toFixed(2)}` : null,
+  ].filter(Boolean) as string[];
+
+  if (over25 !== undefined && over25 >= 60) recommendations.push({ market: 'Gols', recommendation: 'Over 2.5 gols', confidence: 82, rationale: `Over 2.5 ocorreu em média em ${Math.round(over25)}% da amostra recente.`, dataSupport: [...support, `over 2.5: ${Math.round(over25)}%`] });
+  if (over25 !== undefined && over25 <= 40) recommendations.push({ market: 'Gols', recommendation: 'Under 2.5 gols', confidence: 82, rationale: `A frequência média de over 2.5 foi de apenas ${Math.round(over25)}%.`, dataSupport: [...support, `over 2.5: ${Math.round(over25)}%`] });
+  if (btts !== undefined && btts >= 60) recommendations.push({ market: 'Gols', recommendation: 'Ambas as equipes marcam', confidence: 80, rationale: `BTTS ocorreu em média em ${Math.round(btts)}% da amostra recente.`, dataSupport: [...support, `BTTS: ${Math.round(btts)}%`] });
+  if (btts !== undefined && btts <= 35) recommendations.push({ market: 'Gols', recommendation: 'Ambas as equipes não marcam', confidence: 80, rationale: `BTTS ocorreu em média em apenas ${Math.round(btts)}% da amostra recente.`, dataSupport: [...support, `BTTS: ${Math.round(btts)}%`] });
+
+  const pairedCandidate = (family: 'corners' | 'cards', pattern: RegExp, label: string) => {
+    const item = matchingStats(input, pattern).find((stat: any) => finite(stat.home) !== undefined && finite(stat.away) !== undefined);
+    if (!item) return;
+    const total = finite(item.home)! + finite(item.away)!;
+    const line = Math.max(0.5, Math.floor(total) - 0.5);
+    recommendations.push({ market: family === 'corners' ? 'Escanteios' : 'Cartões', recommendation: `Mais de ${line.toFixed(1)} ${label}`, confidence: 78, rationale: `As médias estruturadas somam ${total.toFixed(2)} ${label} por jogo.`, dataSupport: [`Média do mandante: ${item.home} ${label}`, `Média do visitante: ${item.away} ${label}`] });
+  };
+  pairedCandidate('corners', /escanteio|corner/, 'escanteios');
+  pairedCandidate('cards', /cart|amarelo|vermelho/, 'cartões');
+
+  const base: AnalysisResult = {
+    eventId,
+    market: recommendations[0]?.market || 'none',
+    recommendation: recommendations[0]?.recommendation || NO_RECOMMENDATION,
+    confidence: recommendations[0]?.confidence || 0,
+    rationale: recommendations[0]?.rationale || 'Os indicadores objetivos não produziram uma entrada com evidência suficiente.',
+    recommendations,
+    analysisSource: 'heuristic',
+  };
+  const decided = applySelectiveDecisionGate(base, input);
+  const audit = decided.meta?.decisionAudit as DecisionAudit | undefined;
+  const selectedAudit = audit?.candidates?.find((candidate) =>
+    candidate.market === decided.market && candidate.recommendation === decided.recommendation
+  );
+  const resultSupport = decided.bestEntry?.dataSupport || selectedAudit?.confirmations || [];
+  const risks = audit?.missingData || [];
+
+  return {
+    ...decided,
+    matchAnalysis: decided.confidence > 0
+      ? `O motor estatístico selecionou ${decided.recommendation} após cruzar forma recente, médias das equipes e evidências específicas do mercado.`
+      : 'Os indicadores disponíveis não apresentaram convergência suficiente para publicar uma entrada.',
+    keyFactors: resultSupport.slice(0, 3),
+    marketBreakdown: {
+      [decided.market === 'none' ? 'resultado' : decided.market]: decided.rationale,
+    },
+    confidenceDrivers: selectedAudit?.confirmations?.slice(0, 4),
+    riskAnalysis: risks.length
+      ? `Pontos com cobertura limitada: ${risks.join(', ')}.`
+      : 'A entrada pode ser invalidada por mudanças de escalação, contexto pré-jogo ou comportamento diferente da amostra histórica.',
+  };
+}

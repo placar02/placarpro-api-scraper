@@ -9,7 +9,7 @@ import { fetch365Enrichment } from '../scrapers/scores365-enrichment';
 import { fetchStatistics } from '../scrapers/statistics';
 import { fetchStreaks } from '../scrapers/streaks';
 import { fetchTopPlayers } from '../scrapers/top-players';
-import { applySelectiveDecisionGate, normalizeUnavailableData, NO_RECOMMENDATION, OPTIONAL_DATA_UNAVAILABLE } from './decision-engine';
+import { applySelectiveDecisionGate, buildStatisticalDecision, normalizeUnavailableData, NO_RECOMMENDATION, OPTIONAL_DATA_UNAVAILABLE } from './decision-engine';
 import type { AnalysisResult, AnalyzeOptions, BettingRecommendation } from '../types/analysis';
 
 interface LLMAnalysisInput {
@@ -25,6 +25,8 @@ interface LLMAnalysisInput {
   scores365?: any;
   teamForm?: any;
   dataQuality?: any;
+  backendDecision?: any;
+  explanationOnly?: boolean;
 }
 
 interface LLMAnalysisResponse {
@@ -718,8 +720,18 @@ function normalizeGeneratedAnalysis(parsed: any, input: LLMAnalysisInput) {
   const unavailable = OPTIONAL_DATA_UNAVAILABLE;
   const normalized = normalizeUnavailableData({ ...parsed });
   const quality = input.dataQuality || {};
+  const rawMarketBreakdown = normalized.marketBreakdown;
+  const normalizedMarketBreakdown = typeof rawMarketBreakdown === 'string'
+    ? { summary: rawMarketBreakdown }
+    : Array.isArray(rawMarketBreakdown)
+      ? { summary: rawMarketBreakdown.every((item) => typeof item === 'string' && item.length <= 2)
+        ? rawMarketBreakdown.join('')
+        : rawMarketBreakdown.map((item) => typeof item === 'string' ? item : JSON.stringify(item)).join(' ') }
+      : rawMarketBreakdown && typeof rawMarketBreakdown === 'object'
+        ? rawMarketBreakdown
+        : {};
   const marketBreakdown = {
-    ...(normalized.marketBreakdown || {}),
+    ...normalizedMarketBreakdown,
   };
 
   if (!quality.hasCardsData) {
@@ -1135,12 +1147,76 @@ async function callLLMAnalysis(input: LLMAnalysisInput): Promise<LLMAnalysisResp
   return promise;
 }
 
+function compactForm(form: any) {
+  if (!form) return undefined;
+  const pick = (sample: any) => sample ? {
+    played: sample.played, record: sample.record, winRate: sample.winRate,
+    avgGoalsFor: sample.avgGoalsFor, avgGoalsAgainst: sample.avgGoalsAgainst,
+    bttsRate: sample.bttsRate, over25Rate: sample.over25Rate,
+  } : undefined;
+  return {
+    last5: pick(form.last5),
+    last10: pick(form.last10 || form),
+    sequence: limitArray(form.recentMatches, 5).map((match: any) => match.result).filter(Boolean).join('-') || undefined,
+    home: pick(form.homePerformance),
+    away: pick(form.awayPerformance),
+  };
+}
+
+export function buildExplanationInput(input: LLMAnalysisInput, decision: AnalysisResult): LLMAnalysisInput {
+  const relevantStat = /gol|xg|expected|xga|chute.*alvo|finaliza.*alvo|escanteio|corner|cart|amarelo|vermelho/i;
+  const statistics = (input.statistics?.teamPeriods || [])
+    .flatMap((period: any) => period.groups || [])
+    .flatMap((group: any) => group.items || [])
+    .filter((item: any) => relevantStat.test(String(item.name || '')))
+    .slice(0, 16)
+    .map((item: any) => ({ name: item.name, home: item.home, away: item.away }));
+  const h2h = input.teamForm?.headToHead;
+  const audit = decision.meta?.decisionAudit as any;
+
+  return {
+    explanationOnly: true,
+    event: {
+      id: input.event?.id,
+      source: input.event?.source,
+      homeTeam: { name: input.event?.homeTeam?.name },
+      awayTeam: { name: input.event?.awayTeam?.name },
+      tournament: { name: input.event?.tournament?.name },
+      startTimestamp: input.event?.startTimestamp,
+      status: input.event?.status,
+    },
+    teamForm: {
+      homeRecent: compactForm(input.teamForm?.homeRecent),
+      awayRecent: compactForm(input.teamForm?.awayRecent),
+      headToHead: h2h ? {
+        played: h2h.played, record: h2h.record,
+        avgGoalsFor: h2h.avgGoalsFor, avgGoalsAgainst: h2h.avgGoalsAgainst,
+        bttsRate: h2h.bttsRate, over25Rate: h2h.over25Rate,
+      } : undefined,
+    },
+    statistics: { main: statistics },
+    dataQuality: input.dataQuality,
+    backendDecision: {
+      market: decision.market,
+      recommendation: decision.recommendation,
+      confidence: decision.confidence,
+      approved: audit?.decision === 'approved',
+      confirmations: audit?.candidates?.[0]?.confirmations || [],
+      risks: audit?.reasons || audit?.missingData || [],
+    },
+  };
+}
+
 async function performLLMAnalysis(input: LLMAnalysisInput): Promise<LLMAnalysisResponse> {
   const apiKey = process.env.AZURE_OPENAI_API_KEY;
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
   const deploymentName = process.env.AZURE_OPENAI_DEPLOYMENT_NAME;
-  const timeoutMs = Number(process.env.AZURE_OPENAI_TIMEOUT_MS || 45000);
-  const maxTokens = Number(process.env.AZURE_OPENAI_MAX_TOKENS || 2200);
+  const timeoutMs = input.explanationOnly
+    ? Number(process.env.AZURE_OPENAI_EXPLANATION_TIMEOUT_MS || 10000)
+    : Number(process.env.AZURE_OPENAI_TIMEOUT_MS || 45000);
+  const maxTokens = input.explanationOnly
+    ? Number(process.env.AZURE_OPENAI_EXPLANATION_MAX_TOKENS || 400)
+    : Number(process.env.AZURE_OPENAI_MAX_TOKENS || 2200);
   const eventData = input.event;
   const isReasoningModel = process.env.AZURE_OPENAI_REASONING_MODEL === 'true'
     || /^(gpt-5|o[134](?:-|$))/i.test(deploymentName || '');
@@ -1292,8 +1368,14 @@ Odds nunca criam a recomendacao; quando existirem, servem apenas para validar EV
 Se dados forem insuficientes ou conflitantes, retorne recommendations=[] e bestRecommendation=null.
 Responda somente JSON valido com: matchAnalysis, dataCoverage, keyFactors, homeAnalysis, awayAnalysis, refereeAnalysis, playerAnalysis, marketBreakdown, recommendations, bestRecommendation, confidenceDrivers, avoidMarkets e riskAnalysis.
 Cada recommendation deve ter market, recommendation, confidence de 0 a 100, riskLevel, dataSupport, warningSigns e rationale.`;
+    const explanationPrompt = `Voce apenas explica uma decisao ja tomada pelo motor estatistico do backend.
+Nao altere mercado, recomendacao ou confianca de backendDecision e nao crie outra entrada.
+Use somente o resumo recebido. Nao invente dados nem mencione jogadores ou desfalques.
+Se backendDecision.approved=false, explique objetivamente por que nao houve entrada.
+Responda somente JSON valido com: matchAnalysis, keyFactors (maximo 3), marketBreakdown, riskAnalysis e bestRecommendation.
+bestRecommendation deve copiar exatamente market, recommendation e confidence de backendDecision, adicionando apenas rationale, dataSupport e warningSigns.`;
     const requestInput = isReasoningModel ? compactReasoningInput(input) : input;
-    const requestPrompt = isReasoningModel ? reasoningPrompt : prompt;
+    const requestPrompt = input.explanationOnly ? explanationPrompt : isReasoningModel ? reasoningPrompt : prompt;
     const serializedInput = JSON.stringify(requestInput);
     console.log(`Azure OpenAI payload: ${serializedInput.length} chars (${isReasoningModel ? 'compact reasoning' : 'standard'}).`);
     const messages = [
@@ -1308,7 +1390,7 @@ Cada recommendation deve ter market, recommendation, confidence de 0 a 100, risk
     } : {
       messages: [
         { role: 'system', content: 'Voce responde somente JSON valido e analisa futebol em portugues do Brasil.' },
-        { role: 'user', content: `${prompt}\n\nDados:\n${JSON.stringify(input)}` }
+        { role: 'user', content: `${requestPrompt}\n\nDados:\n${JSON.stringify(requestInput)}` }
       ],
       temperature: 0.2,
       max_tokens: maxTokens,
@@ -1352,6 +1434,37 @@ Cada recommendation deve ter market, recommendation, confidence de 0 a 100, risk
 
     console.log('Azure OpenAI raw response:', content);
     const parsed = normalizeGeneratedAnalysis(extractJsonObject(content) as any, input);
+    if (input.explanationOnly && input.backendDecision) {
+      const fixed = input.backendDecision;
+      const explained = parsed.bestRecommendation || {};
+      const bestEntry = buildRecommendation({
+        market: fixed.market,
+        recommendation: fixed.recommendation,
+        confidence: fixed.confidence,
+        riskLevel: fixed.confidence >= 80 ? 'baixo' : 'medio',
+        rationale: explained.rationale || parsed.matchAnalysis || 'Decisão sustentada pelos indicadores objetivos do backend.',
+        dataSupport: Array.isArray(explained.dataSupport) ? explained.dataSupport : fixed.confirmations,
+        warningSigns: Array.isArray(explained.warningSigns) ? explained.warningSigns : fixed.risks,
+      });
+      return { result: {
+        eventId: eventData?.id ?? 'unknown',
+        market: fixed.market,
+        recommendation: fixed.recommendation,
+        confidence: fixed.confidence,
+        rationale: bestEntry.rationale,
+        analysisSource: 'azure-openai',
+        bestEntry,
+        recommendations: [bestEntry],
+        matchAnalysis: parsed.matchAnalysis,
+        keyFactors: Array.isArray(parsed.keyFactors) ? parsed.keyFactors.slice(0, 3) : undefined,
+        homeAnalysis: parsed.homeAnalysis,
+        awayAnalysis: parsed.awayAnalysis,
+        marketBreakdown: parsed.marketBreakdown,
+        confidenceDrivers: Array.isArray(parsed.confidenceDrivers) ? parsed.confidenceDrivers : undefined,
+        avoidMarkets: Array.isArray(parsed.avoidMarkets) ? parsed.avoidMarkets : undefined,
+        riskAnalysis: parsed.riskAnalysis,
+      } };
+    }
     const recommendations: BettingRecommendation[] = [];
 
     if (Array.isArray(parsed.recommendations)) {
@@ -1613,6 +1726,7 @@ function attachEventPresentation(result: AnalysisResult, event: any, lineups?: a
 export async function analyzeEvent(eventId: number | string, options: AnalyzeOptions = {}): Promise<AnalysisResult> {
   const {
     useLLM = true,
+    useLLMExplanation = true,
     includeOdds = false,
     useOddsFallback = false,
     includeEnrichment = true,
@@ -1674,7 +1788,7 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
   let llmError: string | undefined;
 
   if (useLLM) {
-    const llmInput = buildLLMInput(
+    const fullInput = buildLLMInput(
       { raw: eventResp.raw, data: eventResp.data },
       shouldUseOdds ? oddsResp : null,
       statisticsResp,
@@ -1684,30 +1798,47 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
       topPlayersResp,
       scores365Resp
     );
-    const llmAnalysis = await callLLMAnalysis(llmInput);
-    if (llmAnalysis.result?.meta?.decisionAudit) {
-      return attachEventPresentation(llmAnalysis.result, event, lineupsResp);
+    const statisticalDecision = buildStatisticalDecision(fullInput, event.id ?? eventId);
+    const decisionAudit = statisticalDecision.meta?.decisionAudit as any;
+
+    // Rejected matches do not consume Azure quota: the deterministic audit
+    // already contains the complete explanation for the rejection.
+    if (decisionAudit?.decision !== 'approved') {
+      return attachEventPresentation(statisticalDecision, event, lineupsResp);
     }
-    if (isActionableAnalysis(llmAnalysis.result)) return attachEventPresentation(llmAnalysis.result as AnalysisResult, event, lineupsResp);
-    llmError = llmAnalysis.error || (isOgolProvider
-      ? 'LLM returned no actionable recommendation from OGOL data.'
-      : 'LLM returned no actionable recommendation; using heuristic fallback.');
-    if (isOgolProvider) {
-      return attachEventPresentation({
-        eventId,
-        market: 'none',
-        recommendation: 'Nenhuma entrada recomendada para este jogo.',
-        confidence: 0,
-        rationale: 'Os dados disponiveis do OGOL nao atingiram os criterios minimos de qualidade e confirmacao estatistica.',
-        analysisSource: 'azure-openai',
-        meta: {
-          provider: 'ogol',
-          llmError,
-          noOddsFallback: true,
-          noHeuristicFallback: true,
-        },
-      }, event, lineupsResp);
+
+    if (!useLLMExplanation) {
+      return attachEventPresentation(statisticalDecision, event, lineupsResp);
     }
+
+    const explanationInput = buildExplanationInput(fullInput, statisticalDecision);
+    const llmAnalysis = await callLLMAnalysis(explanationInput);
+    llmError = llmAnalysis.error;
+    const explanation = llmAnalysis.result;
+    const explainedDecision: AnalysisResult = {
+      ...statisticalDecision,
+      analysisSource: explanation ? 'azure-openai' : 'heuristic',
+      rationale: explanation?.rationale || explanation?.bestEntry?.rationale || statisticalDecision.rationale,
+      matchAnalysis: explanation?.matchAnalysis,
+      dataCoverage: explanation?.dataCoverage,
+      keyFactors: explanation?.keyFactors,
+      homeAnalysis: explanation?.homeAnalysis,
+      awayAnalysis: explanation?.awayAnalysis,
+      refereeAnalysis: undefined,
+      playerAnalysis: undefined,
+      marketBreakdown: explanation?.marketBreakdown,
+      confidenceDrivers: explanation?.confidenceDrivers,
+      avoidMarkets: explanation?.avoidMarkets,
+      riskAnalysis: explanation?.riskAnalysis,
+      bestEntry: statisticalDecision.bestEntry ? {
+        ...statisticalDecision.bestEntry,
+        rationale: explanation?.bestEntry?.rationale || explanation?.rationale || statisticalDecision.bestEntry.rationale,
+        dataSupport: explanation?.bestEntry?.dataSupport || statisticalDecision.bestEntry.dataSupport,
+        warningSigns: explanation?.bestEntry?.warningSigns || statisticalDecision.bestEntry.warningSigns,
+      } : undefined,
+      meta: { ...(statisticalDecision.meta || {}), llmError, explanationOnly: true },
+    };
+    return attachEventPresentation(explainedDecision, event, lineupsResp);
   }
 
   if (useOddsFallback && oddsResp && oddsResp.markets_by_group) {

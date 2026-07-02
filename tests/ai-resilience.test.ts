@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { compactReasoningInput, fetchAzureWithRetry } from '../src/analysis/ai';
+import { buildExplanationInput, compactReasoningInput, fetchAzureWithRetry } from '../src/analysis/ai';
 
 describe('resiliencia do Azure OpenAI', () => {
   afterEach(() => {
@@ -45,5 +45,24 @@ describe('resiliencia do Azure OpenAI', () => {
     expect(serialized.length).toBeLessThan(8000);
     expect(serialized).not.toContain('html');
     expect(serialized).not.toContain('pages');
+  });
+
+  it('envia para a IA somente o resumo objetivo sem jogadores ou desfalques', () => {
+    const full: any = {
+      event: { id: 1, source: 'ogol', homeTeam: { name: 'Casa' }, awayTeam: { name: 'Fora' }, tournament: { name: 'Liga' } },
+      lineups: { home: { starters: [{ name: 'Nao enviar' }], missingPlayers: [{ name: 'Lesionado' }] } },
+      statistics: { teamPeriods: [{ groups: [{ items: [
+        { name: 'Gols por jogo', home: 1.8, away: 1.2 },
+        { name: 'Dado interno irrelevante', home: 99, away: 99 },
+      ] }] }], players: [{ name: 'Nao enviar', goals: 10 }] },
+      teamForm: { homeRecent: { last5: { played: 5, avgGoalsFor: 1.8 }, recentMatches: [{ result: 'W' }] }, awayRecent: { last5: { played: 5, avgGoalsFor: 1.2 } } },
+    };
+    const summary = buildExplanationInput(full, { eventId: 1, market: 'Gols', recommendation: 'Over 2.5 gols', confidence: 78, rationale: 'ok' });
+    const serialized = JSON.stringify(summary);
+    expect(serialized).not.toContain('Nao enviar');
+    expect(serialized).not.toContain('Lesionado');
+    expect(serialized).not.toContain('Dado interno irrelevante');
+    expect(serialized).toContain('Gols por jogo');
+    expect(serialized.length).toBeLessThan(5000);
   });
 });
