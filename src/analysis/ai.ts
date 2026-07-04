@@ -1377,7 +1377,6 @@ bestRecommendation deve copiar exatamente market, recommendation e confidence de
     const requestInput = isReasoningModel ? compactReasoningInput(input) : input;
     const requestPrompt = input.explanationOnly ? explanationPrompt : isReasoningModel ? reasoningPrompt : prompt;
     const serializedInput = JSON.stringify(requestInput);
-    console.log(`Azure OpenAI payload: ${serializedInput.length} chars (${isReasoningModel ? 'compact reasoning' : 'standard'}).`);
     const messages = [
       { role: isReasoningModel ? 'developer' : 'system', content: 'Voce responde somente JSON valido e analisa futebol em portugues do Brasil.' },
       { role: 'user', content: `${requestPrompt}\n\nDados:\n${serializedInput}` }
@@ -1400,10 +1399,7 @@ bestRecommendation deve copiar exatamente market, recommendation e confidence de
     const url = isReasoningModel
       ? `${normalizeAzureEndpoint(endpoint)}openai/v1/chat/completions`
       : `${normalizeAzureEndpoint(endpoint)}openai/deployments/${deploymentName}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`;
-    console.log('Calling Azure OpenAI at:', url);
     const res = await fetchAzureWithRetry(url, requestBody, apiKey, timeoutMs);
-
-    console.log('Azure OpenAI response status:', res.status);
 
     if (!res.ok) {
       const errorText = await res.text();
@@ -1432,7 +1428,6 @@ bestRecommendation deve copiar exatamente market, recommendation e confidence de
       return { result: null, error: 'No content in Azure OpenAI response' };
     }
 
-    console.log('Azure OpenAI raw response:', content);
     const parsed = normalizeGeneratedAnalysis(extractJsonObject(content) as any, input);
     if (input.explanationOnly && input.backendDecision) {
       const fixed = input.backendDecision;
@@ -1526,7 +1521,6 @@ bestRecommendation deve copiar exatamente market, recommendation e confidence de
     result.meta = { source: 'azure-openai', rawResponse: json, eventId: eventData?.id ?? 'unknown' };
     const enrichedResult = enrichAnalysisWithRealOdds(result, input.odds);
     const gatedResult = applySelectiveDecisionGate(enrichedResult, input);
-    console.log('Azure OpenAI analysis success:', gatedResult.analysisSource);
     return { result: gatedResult };
   } catch (err) {
     console.error('Azure OpenAI analysis error:', err);
