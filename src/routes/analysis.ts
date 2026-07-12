@@ -71,6 +71,11 @@ type CachedFullDaily = {
   value: FullDailyAnalysisResponse;
 };
 
+type CachedMatchesResponse = {
+  expiresAt: number;
+  value: any;
+};
+
 type AnalyzeConcurrencyConfig = {
   concurrency: number;
   timeoutMs: number;
@@ -111,6 +116,7 @@ type MatchDataProfile = {
 
 const analysisEventCache = new Map<string, CachedAnalysis>();
 const fullDailyCache = new Map<string, CachedFullDaily>();
+const analysisMatchesCache = new Map<string, CachedMatchesResponse>();
 const profileCache = new Map<string, { expiresAt: number; value: MatchDataProfile }>();
 const profileInFlight = new Map<string, Promise<MatchDataProfile>>();
 const MAX_ANALYSIS_EVENT_CACHE_ITEMS = 500;
@@ -570,14 +576,30 @@ function isFullDataProfile(profile: MatchDataProfile, strictMarkets: boolean) {
 
 async function fetchMatchesForAnalysisDay(date: string, mode: string) {
   const provider = process.env.SCORES_PROVIDER;
-  if (provider === '365scores') return fetch365Matches(date);
-  if (provider === 'ogol') return fetchOgolMatches(date);
-  if (provider === 'aiscore') return fetchAiScoreMatches(date);
-  if (mode === 'live') {
-    const { fetchLiveMatches } = await import('../scrapers/live');
-    return fetchLiveMatches({ retryOn403: true });
+  const cacheKey = `${provider || 'sofascore'}:${date}:${mode}`;
+  const cached = analysisMatchesCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (cached) analysisMatchesCache.delete(cacheKey);
+
+  const value = await (async () => {
+    if (provider === '365scores') return fetch365Matches(date);
+    if (provider === 'ogol') return fetchOgolMatches(date);
+    if (provider === 'aiscore') return fetchAiScoreMatches(date);
+    if (mode === 'live') {
+      const { fetchLiveMatches } = await import('../scrapers/live');
+      return fetchLiveMatches({ retryOn403: true });
+    }
+    return fetchScheduledMatches(date, true);
+  })();
+
+  const defaultTtl = mode === 'live' ? 15_000 : 120_000;
+  const ttlMs = Math.max(0, Number(process.env.ANALYSIS_MATCHES_CACHE_TTL_MS || defaultTtl));
+  if (ttlMs > 0) {
+    analysisMatchesCache.set(cacheKey, { expiresAt: Date.now() + ttlMs, value });
+    pruneCache(analysisMatchesCache, 100);
   }
-  return fetchScheduledMatches(date, true);
+
+  return value;
 }
 
 function filterMatchesForMode(events: any[], mode: string) {
@@ -1357,6 +1379,19 @@ analysisRouter.get('/analysis/full-daily', async (req, res) => {
     console.error('Full daily analysis error', error.stack || error.message);
     res.status(500).json({ ok: false, error: String(err) });
   }
+});
+
+// Backward-compatible alias for older clients.
+analysisRouter.get('/analysis/daily', (req, res) => {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(req.query)) {
+    if (Array.isArray(value)) {
+      for (const item of value) query.append(key, String(item));
+    } else if (value !== undefined) {
+      query.set(key, String(value));
+    }
+  }
+  res.redirect(307, `/analysis/full-daily${query ? `?${query}` : ''}`);
 });
 
 analysisRouter.get('/analysis/tournament', async (req, res) => {

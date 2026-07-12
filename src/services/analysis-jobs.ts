@@ -28,6 +28,29 @@ let activeJobs = 0;
 const concurrency = () => Math.max(1, Number(process.env.ANALYSIS_JOB_CONCURRENCY || 1));
 const ttlMs = () => Math.max(60_000, Number(process.env.ANALYSIS_JOB_TTL_MS || 60 * 60 * 1000));
 
+function queuePosition(job: AnalysisJob) {
+  if (job.status !== 'queued') return undefined;
+  const index = queue.findIndex((item) => item.job.id === job.id);
+  return index >= 0 ? index + 1 : undefined;
+}
+
+function statusMessage(job: AnalysisJob) {
+  if (job.status === 'queued') {
+    const position = queuePosition(job);
+    return position && position > 1
+      ? `Na fila de analise (${position} na fila)`
+      : 'Na fila de analise';
+  }
+  if (job.status === 'processing') {
+    if (job.key.startsWith('full-daily:')) return 'Selecionando partidas com dados fortes';
+    if (job.key.startsWith('tournament')) return 'Analisando jogos do campeonato';
+    if (job.key.startsWith('teams:')) return 'Localizando partida e cruzando estatisticas';
+    return 'Cruzando estatisticas e validando mercado';
+  }
+  if (job.status === 'completed') return 'Analise concluida';
+  return 'Nao foi possivel concluir a analise';
+}
+
 function pruneJobs() {
   const threshold = Date.now() - ttlMs();
   for (const [id, job] of jobs) {
@@ -98,6 +121,8 @@ export function analysisJobPayload(job: AnalysisJob) {
     ok: job.status !== 'failed',
     jobId: job.id,
     status: job.status,
+    statusMessage: statusMessage(job),
+    queuePosition: queuePosition(job),
     pending,
     pollAfterMs: pending ? Number(process.env.ANALYSIS_JOB_POLL_MS || 1500) : undefined,
     mode: pending ? 'fast' : 'complete',
