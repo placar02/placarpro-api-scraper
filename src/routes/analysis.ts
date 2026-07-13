@@ -641,6 +641,7 @@ function analysisCacheKey(eventId: string | number, options: AnalyzeOptions) {
     eventId: String(eventId),
     useLLM: options.useLLM !== false,
     useLLMExplanation: options.useLLMExplanation !== false,
+    explainRejected: Boolean(options.explainRejected),
     includeOdds: Boolean(options.includeOdds),
     useOddsFallback: Boolean(options.useOddsFallback),
     includeEnrichment: options.includeEnrichment !== false,
@@ -1334,6 +1335,8 @@ analysisRouter.get('/analysis/full-daily', async (req, res) => {
 
     const options = {
       useLLM: req.query.useLLM !== 'false',
+      useLLMExplanation: req.query.useLLMExplanation !== 'false',
+      explainRejected: req.query.explainRejected !== 'false',
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
       includeEnrichment: req.query.includeEnrichment !== 'false',
@@ -1487,6 +1490,8 @@ analysisRouter.get('/analysis', async (req, res) => {
 
     const result = await analyzeEvent(resolved.eventId, {
       useLLM: req.query.useLLM !== 'false',
+      useLLMExplanation: req.query.useLLMExplanation !== 'false',
+      explainRejected: req.query.explainRejected === 'true',
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
       includeEnrichment: req.query.includeEnrichment !== 'false',

@@ -1212,10 +1212,10 @@ async function performLLMAnalysis(input: LLMAnalysisInput): Promise<LLMAnalysisR
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
   const deploymentName = process.env.AZURE_OPENAI_DEPLOYMENT_NAME;
   const timeoutMs = input.explanationOnly
-    ? Number(process.env.AZURE_OPENAI_EXPLANATION_TIMEOUT_MS || 10000)
+    ? Number(process.env.AZURE_OPENAI_EXPLANATION_TIMEOUT_MS || 20000)
     : Number(process.env.AZURE_OPENAI_TIMEOUT_MS || 45000);
   const maxTokens = input.explanationOnly
-    ? Number(process.env.AZURE_OPENAI_EXPLANATION_MAX_TOKENS || 400)
+    ? Number(process.env.AZURE_OPENAI_EXPLANATION_MAX_TOKENS || 900)
     : Number(process.env.AZURE_OPENAI_MAX_TOKENS || 2200);
   const eventData = input.event;
   const isReasoningModel = process.env.AZURE_OPENAI_REASONING_MODEL === 'true'
@@ -1421,11 +1421,18 @@ bestRecommendation deve copiar exatamente market, recommendation e confidence de
     azureRateLimitReason = '';
 
     const json = await res.json();
-    const content = json?.choices?.[0]?.message?.content;
+    const rawContent = json?.choices?.[0]?.message?.content;
+    const content = Array.isArray(rawContent)
+      ? rawContent
+        .map((part: any) => typeof part === 'string' ? part : part?.text || part?.content || '')
+        .join('')
+      : rawContent;
 
     if (!content) {
       console.error('No content in Azure OpenAI response:', json);
-      return { result: null, error: 'No content in Azure OpenAI response' };
+      const finishReason = json?.choices?.[0]?.finish_reason || json?.choices?.[0]?.finishReason;
+      const usage = json?.usage ? ` usage=${JSON.stringify(json.usage)}` : '';
+      return { result: null, error: `No content in Azure OpenAI response${finishReason ? `; finish_reason=${finishReason}` : ''}${usage}` };
     }
 
     const parsed = normalizeGeneratedAnalysis(extractJsonObject(content) as any, input);
@@ -1721,6 +1728,7 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
   const {
     useLLM = true,
     useLLMExplanation = true,
+    explainRejected = false,
     includeOdds = false,
     useOddsFallback = false,
     includeEnrichment = true,
@@ -1795,9 +1803,9 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
     const statisticalDecision = buildStatisticalDecision(fullInput, event.id ?? eventId);
     const decisionAudit = statisticalDecision.meta?.decisionAudit as any;
 
-    // Rejected matches do not consume Azure quota: the deterministic audit
-    // already contains the complete explanation for the rejection.
-    if (decisionAudit?.decision !== 'approved') {
+    // By default rejected matches do not consume Azure quota. Manual searches can
+    // opt in to an LLM explanation so the user sees why there was no entry.
+    if (decisionAudit?.decision !== 'approved' && !explainRejected) {
       return attachEventPresentation(statisticalDecision, event, lineupsResp);
     }
 
