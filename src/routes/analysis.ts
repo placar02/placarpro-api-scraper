@@ -54,6 +54,7 @@ type FullDailyAnalysisResponse = {
   candidatesChecked: number;
   qualifiedMatches: number;
   selectedEventIds: string[];
+  selectedEvents: any[];
   bestEntry: AnalysisResult | null;
   entries: Array<AnalysisResult & { dataProfile?: MatchDataProfile }>;
   analyses: Array<AnalysisResult & { dataProfile?: MatchDataProfile }>;
@@ -305,6 +306,59 @@ function eventCompletenessScore(event: any) {
   if (!isFinished(event)) score += 8;
   if (isLive(event)) score += 6;
   return score;
+}
+
+const DEFAULT_PRIORITY_TEAMS = [
+  'athletico paranaense', 'atletico mineiro', 'bahia', 'botafogo', 'corinthians',
+  'cruzeiro', 'flamengo', 'fluminense', 'fortaleza', 'gremio', 'internacional',
+  'palmeiras', 'red bull bragantino', 'santos', 'sao paulo', 'sport', 'vasco', 'vitoria',
+  'boca juniors', 'river plate', 'racing club', 'independiente', 'san lorenzo',
+  'barcelona', 'real madrid', 'atletico madrid', 'manchester city', 'manchester united',
+  'liverpool', 'arsenal', 'chelsea', 'tottenham', 'bayern munich', 'borussia dortmund',
+  'juventus', 'inter', 'milan', 'napoli', 'paris saint germain', 'benfica', 'porto', 'sporting',
+];
+
+const DEFAULT_PRIORITY_TOURNAMENTS = [
+  'brasileirao', 'campeonato brasileiro', 'serie a', 'copa do brasil', 'libertadores',
+  'sul americana', 'champions league', 'europa league', 'premier league', 'la liga',
+  'bundesliga', 'ligue 1', 'liga portugal', 'major league soccer', 'liga profesional',
+];
+
+function configuredPriorityValues(envName: string, defaults: string[]) {
+  const configured = String(process.env[envName] || '')
+    .split(',')
+    .map((value) => normalizeDataText(value).trim())
+    .filter(Boolean);
+  return [...new Set([...defaults, ...configured])];
+}
+
+function matchesPriorityValue(value: unknown, priorities: string[]) {
+  const normalized = normalizeDataText(value).replace(/[^a-z0-9]+/g, ' ').trim();
+  return priorities.some((priority) => (
+    normalized === priority
+    || normalized.startsWith(`${priority} `)
+    || normalized.endsWith(` ${priority}`)
+  ));
+}
+
+function matchRelevanceScore(event: any) {
+  const priorityTeams = configuredPriorityValues('FULL_DAILY_PRIORITY_TEAMS', DEFAULT_PRIORITY_TEAMS);
+  const priorityTournaments = configuredPriorityValues('FULL_DAILY_PRIORITY_TOURNAMENTS', DEFAULT_PRIORITY_TOURNAMENTS);
+  const homePriority = matchesPriorityValue(event?.homeTeam?.name, priorityTeams);
+  const awayPriority = matchesPriorityValue(event?.awayTeam?.name, priorityTeams);
+  const tournament = normalizeDataText(event?.tournament?.name || event?.competition?.name).replace(/[^a-z0-9]+/g, ' ').trim();
+  const tournamentPriority = priorityTournaments.some((priority) => tournament.includes(priority));
+  let score = 0;
+  if (homePriority) score += 22;
+  if (awayPriority) score += 22;
+  if (homePriority && awayPriority) score += 16;
+  if (tournamentPriority) score += 30;
+  return score;
+}
+
+function dailyProfileRankingScore(item: { event: any; profile: MatchDataProfile }, strictMarkets: boolean) {
+  const fullDataBonus = isFullDataProfile(item.profile, strictMarkets) ? 10 : 0;
+  return item.profile.score + matchRelevanceScore(item.event) + fullDataBonus;
 }
 
 async function safeLoad<T>(loader: () => Promise<T>): Promise<T | null> {
@@ -603,13 +657,25 @@ async function fetchMatchesForAnalysisDay(date: string, mode: string) {
 }
 
 function filterMatchesForMode(events: any[], mode: string) {
-  return events
+  const filtered = events
     .filter((event) => event?.id && !isFinished(event))
     .filter((event) => {
       if (mode === 'live') return isLive(event);
       if (mode === 'all') return true;
       return !isLive(event);
-    })
+    });
+  const unique = new Map<string, any>();
+
+  for (const event of filtered) {
+    const home = normalizeDataText(event?.homeTeam?.name).replace(/[^a-z0-9]+/g, ' ').trim();
+    const away = normalizeDataText(event?.awayTeam?.name).replace(/[^a-z0-9]+/g, ' ').trim();
+    const timestamp = getEventTimestamp(event);
+    const key = home && away && timestamp ? `${home}|${away}|${timestamp}` : `id:${event.id}`;
+    const current = unique.get(key);
+    if (!current || eventCompletenessScore(event) > eventCompletenessScore(current)) unique.set(key, event);
+  }
+
+  return [...unique.values()]
     .sort((a, b) => {
       const scoreDelta = eventCompletenessScore(b) - eventCompletenessScore(a);
       if (scoreDelta !== 0) return scoreDelta;
@@ -820,7 +886,7 @@ async function analyzeBestDaily(date: string, options: AnalyzeOptions, config: {
   };
 }
 
-async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: { limit: number; maxCandidates: number; mode: string; strictMarkets: boolean; strictFull: boolean; analysisConcurrency: number; analysisTimeoutMs: number; analysisRetries: number; analysisCacheTtlMs: number; fullDailyCacheTtlMs: number; profileTimeoutMs: number; profileBudgetMs: number }): Promise<FullDailyAnalysisResponse> {
+async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: { limit: number; maxCandidates: number; profileCandidateLimit: number; mode: string; strictMarkets: boolean; strictFull: boolean; analysisConcurrency: number; analysisTimeoutMs: number; analysisRetries: number; analysisCacheTtlMs: number; fullDailyCacheTtlMs: number; profileTimeoutMs: number; profileBudgetMs: number }): Promise<FullDailyAnalysisResponse> {
   const cacheKey = fullDailyCacheKey(date, options, config);
   const cached = getCachedFullDaily(cacheKey);
   if (cached) {
@@ -839,11 +905,13 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
       ? matchesResponse.data
       : [];
   const matches = filterMatchesForMode(events, config.mode);
-  const profileCandidateLimit = process.env.SCORES_PROVIDER === 'ogol'
-    ? Math.max(config.limit, Number(process.env.FULL_DAILY_PROFILE_CANDIDATE_LIMIT || config.limit + 2))
-    : config.maxCandidates;
+  const profileCandidateLimit = Math.max(config.limit, config.profileCandidateLimit);
   const candidateEvents = [...matches]
-    .sort((a, b) => eventCompletenessScore(b) - eventCompletenessScore(a) || getEventTimestamp(a) - getEventTimestamp(b))
+    .sort((a, b) => (
+      matchRelevanceScore(b) - matchRelevanceScore(a)
+      || eventCompletenessScore(b) - eventCompletenessScore(a)
+      || getEventTimestamp(a) - getEventTimestamp(b)
+    ))
     .slice(0, Math.min(config.maxCandidates, profileCandidateLimit));
   const ogolConcurrency = Math.max(1, Number(process.env.OGOL_ANALYSIS_CONCURRENCY || 1));
   const providerConcurrency = process.env.SCORES_PROVIDER === 'ogol' ? ogolConcurrency : 2;
@@ -851,16 +919,16 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
   const profiles = await inspectProfilesWithConcurrency(candidateEvents, concurrency, config.profileTimeoutMs, config.profileBudgetMs);
   const qualified = profiles
     .filter((item) => isFullDataProfile(item.profile, config.strictMarkets))
-    .sort((a, b) => b.profile.score - a.profile.score || eventCompletenessScore(b.event) - eventCompletenessScore(a.event));
+    .sort((a, b) => dailyProfileRankingScore(b, config.strictMarkets) - dailyProfileRankingScore(a, config.strictMarkets));
   const rankedProfiles = profiles
     .filter((item) => item.profile.score > 0 && !item.profile.missing.includes('profile_inspection'))
-    .sort((a, b) => b.profile.score - a.profile.score || eventCompletenessScore(b.event) - eventCompletenessScore(a.event));
+    .sort((a, b) => (
+      dailyProfileRankingScore(b, config.strictMarkets) - dailyProfileRankingScore(a, config.strictMarkets)
+      || eventCompletenessScore(b.event) - eventCompletenessScore(a.event)
+    ));
   const selected = config.strictFull
     ? qualified.slice(0, config.limit)
-    : [
-      ...qualified,
-      ...rankedProfiles.filter((item) => !qualified.some((qualifiedItem) => String(qualifiedItem.event.id) === String(item.event.id))),
-    ].slice(0, config.limit);
+    : rankedProfiles.slice(0, config.limit);
   const eventIds = selected.map((item) => String(item.event.id));
   const { analyses: statisticalAnalyses, skipped } = await analyzeWithConcurrency(
     eventIds,
@@ -872,7 +940,8 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
   );
   const rankedStatistical = statisticalAnalyses
     .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
-  const bestStatistical = rankedStatistical.find((analysis) => Number(analysis.confidence || 0) > 0);
+  const bestStatistical = rankedStatistical.find((analysis) => Number(analysis.confidence || 0) > 0)
+    || (options.explainRejected ? rankedStatistical[0] : undefined);
   let analyses = rankedStatistical;
   if (bestStatistical && options.useLLM !== false && options.useLLMExplanation !== false) {
     try {
@@ -886,7 +955,11 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
       console.warn(`Explicacao da melhor entrada ignorada por latencia: ${formatAttemptError(error)}`);
     }
   }
-  const profileById = new Map(selected.map((item) => [String(item.event.id), item.profile]));
+  const profileById = new Map(selected.map((item) => [String(item.event.id), {
+    ...item.profile,
+    relevanceScore: matchRelevanceScore(item.event),
+    selectionScore: dailyProfileRankingScore(item, config.strictMarkets),
+  }]));
   const analysesWithProfiles = analyses
     .map((analysis) => ({
       ...analysis,
@@ -919,7 +992,8 @@ async function analyzeFullDaily(date: string, options: AnalyzeOptions, config: {
     matchesFound: matches.length,
     candidatesChecked: candidateEvents.length,
     qualifiedMatches: qualified.length,
-    selectedEventIds: entries.map((analysis) => String(analysis.eventId)),
+    selectedEventIds: selected.map((item) => String(item.event.id)),
+    selectedEvents: selected.map((item) => item.event),
     bestEntry: entries[0] || null,
     entries,
     analyses: analysesWithProfiles,
@@ -1287,6 +1361,12 @@ analysisRouter.get('/analysis/full-daily', async (req, res) => {
     const date = typeof req.query.date === 'string' && req.query.date ? req.query.date : getTodayDate();
     const limit = parsePositiveInt(req.query.limit, 5, 5, 10);
     const maxCandidates = parsePositiveInt(req.query.maxCandidates, Math.max(20, limit), limit, 40);
+    const profileCandidateLimit = parsePositiveInt(
+      req.query.profileCandidateLimit,
+      Number(process.env.FULL_DAILY_PROFILE_CANDIDATE_LIMIT || Math.min(maxCandidates, 15)),
+      limit,
+      40
+    );
     const mode = ['prelive', 'live', 'all'].includes(String(req.query.mode || '').toLowerCase())
       ? String(req.query.mode).toLowerCase()
       : 'prelive';
@@ -1344,6 +1424,7 @@ analysisRouter.get('/analysis/full-daily', async (req, res) => {
     const config = {
       limit,
       maxCandidates,
+      profileCandidateLimit,
       mode,
       strictMarkets,
       strictFull,
@@ -1415,7 +1496,14 @@ analysisRouter.get('/analysis/tournament', async (req, res) => {
       analysisTimeoutMs: parsePositiveInt(req.query.analysisTimeoutMs, 90000, 10000, 180000),
       mode: ['prelive', 'live', 'all'].includes(String(req.query.mode || '').toLowerCase()) ? String(req.query.mode).toLowerCase() : 'prelive',
     };
-    const options = { useLLM: req.query.useLLM !== 'false', includeOdds: false, useOddsFallback: false, includeEnrichment: isTrue(req.query.includeEnrichment) };
+    const options = {
+      useLLM: req.query.useLLM !== 'false',
+      useLLMExplanation: req.query.useLLMExplanation !== 'false',
+      explainRejected: req.query.explainRejected === 'true',
+      includeOdds: false,
+      useOddsFallback: false,
+      includeEnrichment: isTrue(req.query.includeEnrichment),
+    };
     if (!shouldWait(req)) {
       const cached: any = process.env.SCORES_PROVIDER === 'ogol' ? await fetchOgolMatchesFastCached(date) : { events: [] };
       const events = filterMatchesForMode(cached.events || [], config.mode)
@@ -1452,6 +1540,8 @@ analysisRouter.get('/analysis/tournament/:tournamentId', async (req, res) => {
 
     const options = {
       useLLM: req.query.useLLM !== 'false',
+      useLLMExplanation: req.query.useLLMExplanation !== 'false',
+      explainRejected: req.query.explainRejected === 'true',
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
       includeEnrichment: isTrue(req.query.includeEnrichment),
@@ -1514,6 +1604,8 @@ analysisRouter.get('/analysis/by-teams', async (req, res) => {
   try {
     const options = {
       useLLM: req.query.useLLM !== 'false',
+      useLLMExplanation: req.query.useLLMExplanation !== 'false',
+      explainRejected: req.query.explainRejected === 'true',
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
       includeEnrichment: req.query.includeEnrichment !== 'false',
@@ -1636,6 +1728,8 @@ analysisRouter.get('/analysis/:eventId', async (req, res) => {
 
       const options = {
         useLLM: req.query.useLLM !== 'false',
+        useLLMExplanation: req.query.useLLMExplanation !== 'false',
+        explainRejected: req.query.explainRejected === 'true',
         includeOdds: isTrue(req.query.includeOdds),
         useOddsFallback: isTrue(req.query.useOddsFallback),
         includeEnrichment: req.query.includeEnrichment !== 'false',
@@ -1658,6 +1752,8 @@ analysisRouter.get('/analysis/:eventId', async (req, res) => {
 
     const options = {
       useLLM: req.query.useLLM !== 'false',
+      useLLMExplanation: req.query.useLLMExplanation !== 'false',
+      explainRejected: req.query.explainRejected === 'true',
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
       includeEnrichment: req.query.includeEnrichment !== 'false',
