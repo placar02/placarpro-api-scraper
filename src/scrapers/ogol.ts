@@ -437,7 +437,13 @@ function isAgendaNoiseToken(value: string) {
   return false;
 }
 
-function parseAgendaMatchText(rawText: string, rawNearText: string, url: string, fallbackDate?: string): OgolMatch | null {
+function parseAgendaMatchText(
+  rawText: string,
+  rawNearText: string,
+  url: string,
+  fallbackDate?: string,
+  tournamentName?: string,
+): OgolMatch | null {
   const id = parseEventIdFromUrl(url);
   if (!id) return null;
 
@@ -495,6 +501,7 @@ function parseAgendaMatchText(rawText: string, rawNearText: string, url: string,
     homeScore,
     awayScore,
     statusText,
+    tournamentName: tournamentName?.trim() || undefined,
     date: parseDateFromMatchUrl(url) || fallbackDate,
     time,
     odds,
@@ -838,16 +845,45 @@ async function extractAgendaLinks(page: Page) {
 async function extractAgendaMatches(page: Page, fallbackDate?: string) {
   const extracted = await page.evaluate(() => {
     return [...document.querySelectorAll<HTMLAnchorElement>('a[href*="/jogo/"],a[href*="/ao-vivo/"]')]
-      .map((anchor) => ({
-        href: anchor.href,
-        text: anchor.innerText || anchor.textContent || '',
-        nearText: (anchor.closest('article,li,tr,section,div') as HTMLElement | null)?.innerText || '',
-      }));
+      .map((anchor) => {
+        const container = anchor.closest('article,li,tr,[class*="game"],[class*="match"],section,div') as HTMLElement | null;
+        const directCompetition = container?.querySelector<HTMLElement>(
+          '[data-competition-name],[data-tournament-name],[class*="competition"],[class*="tournament"],[class*="league"]'
+        );
+        let tournamentName = directCompetition?.dataset.competitionName
+          || directCompetition?.dataset.tournamentName
+          || directCompetition?.innerText?.trim()
+          || '';
+        if (tournamentName.length > 120) tournamentName = '';
+
+        let current: Element | null = container || anchor;
+        for (let depth = 0; !tournamentName && current && depth < 5; depth += 1) {
+          let sibling = current.previousElementSibling;
+          for (let step = 0; sibling && step < 4; step += 1, sibling = sibling.previousElementSibling) {
+            const heading = sibling.matches('h2,h3,h4,[class*="competition"],[class*="tournament"],[class*="league"]')
+              ? sibling as HTMLElement
+              : sibling.querySelector<HTMLElement>('h2,h3,h4,[class*="competition"],[class*="tournament"],[class*="league"]');
+            const headingText = heading?.innerText?.replace(/\s+/g, ' ').trim();
+            if (headingText && headingText.length <= 120) {
+              tournamentName = headingText;
+              break;
+            }
+          }
+          current = current.parentElement;
+        }
+
+        return {
+          href: anchor.href,
+          text: anchor.innerText || anchor.textContent || '',
+          nearText: container?.innerText || '',
+          tournamentName,
+        };
+      });
   });
 
   const byId = new Map<number, OgolMatch>();
   for (const raw of extracted) {
-    const match = parseAgendaMatchText(raw.text, raw.nearText, raw.href, fallbackDate);
+    const match = parseAgendaMatchText(raw.text, raw.nearText, raw.href, fallbackDate, raw.tournamentName);
     if (match && !byId.has(match.id)) byId.set(match.id, match);
   }
 

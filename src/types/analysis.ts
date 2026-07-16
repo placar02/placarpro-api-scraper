@@ -1,3 +1,5 @@
+import type { ChampionshipPriority } from '../config/championshipPriority';
+
 export interface BettingRecommendation {
   market: string;
   recommendation: string;
@@ -53,6 +55,7 @@ export interface AnalysisResult {
   bestEntry?: BettingRecommendation;
   recommendations?: BettingRecommendation[];
   analysisSource?: 'azure-openai' | 'odds' | 'heuristic' | 'odds-fallback';
+  championshipPriority?: ChampionshipPriority;
   meta?: Record<string, unknown>;
 }
 
