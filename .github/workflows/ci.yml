@@ -1,0 +1,20 @@
+name: CI Scraper
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install chromium
+      - name: Testes unitarios
+        run: npx vitest run tests/ai-resilience.test.ts tests/championship-priority.test.ts tests/decision-engine.test.ts tests/odds-validation.test.ts tests/ogol-deep.test.ts
+      - run: npm run build
