@@ -41,6 +41,12 @@ export interface AnalysisResult {
   };
   tournamentName?: string;
   startTimestamp?: number;
+  round?: number | string;
+  venue?: {
+    id?: number | string;
+    name?: string;
+    city?: string;
+  } | string;
   matchAnalysis?: string;
   dataCoverage?: Record<string, unknown>;
   keyFactors?: string[];
@@ -56,6 +62,7 @@ export interface AnalysisResult {
   recommendations?: BettingRecommendation[];
   analysisSource?: 'azure-openai' | 'odds' | 'heuristic' | 'odds-fallback';
   championshipPriority?: ChampionshipPriority;
+  analysisStatus?: 'approved' | 'rejected' | 'waiting_odds';
   meta?: Record<string, unknown>;
 }
 
@@ -66,4 +73,6 @@ export interface AnalyzeOptions {
   includeOdds?: boolean;
   useOddsFallback?: boolean;
   includeEnrichment?: boolean;
+  requireRealOdds?: boolean;
+  minimumExpectedValue?: number;
 }

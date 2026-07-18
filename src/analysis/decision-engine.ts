@@ -1,9 +1,17 @@
 import type { AnalysisResult, BettingRecommendation } from '../types/analysis';
+import { getMarketDecisionPolicy, type AnalysisMarketFamily, type MarketDecisionPolicy } from '../config/decisionPolicy';
+import { enrichAnalysisWithValidatedOdds } from './odds-validation';
 
 export const NO_RECOMMENDATION = 'Nenhuma entrada recomendada para este jogo.';
 export const OPTIONAL_DATA_UNAVAILABLE = 'Dado não disponível.';
 
-type MarketFamily = 'goals' | 'winner' | 'corners' | 'cards' | 'player' | 'unknown';
+type MarketFamily = AnalysisMarketFamily;
+
+export type DecisionGateOptions = {
+  requireRealOdds?: boolean;
+  minimumExpectedValue?: number;
+  oddsResponses?: any | any[];
+};
 
 export type DecisionCandidateAudit = {
   market: string;
@@ -16,10 +24,15 @@ export type DecisionCandidateAudit = {
   confirmations: string[];
   rejectionReasons: string[];
   expectedValue?: number;
+  probabilityEdge?: number;
+  fairImpliedProbability?: number;
+  oddsStatus?: string;
+  oddsAudit?: unknown;
+  policy: MarketDecisionPolicy;
 };
 
 export type DecisionAudit = {
-  decision: 'approved' | 'rejected';
+  decision: 'approved' | 'rejected' | 'waiting_odds';
   threshold: number;
   dataQuality: number;
   missingData: string[];
@@ -27,6 +40,7 @@ export type DecisionAudit = {
   selectedMarket?: string;
   selectedRecommendation?: string;
   reasons: string[];
+  requireRealOdds?: boolean;
 };
 
 function normalized(value: unknown) {
@@ -271,8 +285,7 @@ function decimalOdd(recommendation: BettingRecommendation) {
   return value && value > 1 ? value : undefined;
 }
 
-export function applySelectiveDecisionGate(result: AnalysisResult, input: any): AnalysisResult {
-  const threshold = clamp(finite(process.env.ANALYSIS_MIN_CONFIDENCE) ?? 68, 55, 90);
+export function applySelectiveDecisionGate(result: AnalysisResult, input: any, options: DecisionGateOptions = {}): AnalysisResult {
   const quality = dataQuality(input);
   const sourceRecommendations = result.recommendations?.length
     ? result.recommendations
@@ -285,10 +298,21 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any): 
         rationale: result.rationale,
       }];
 
-  const candidates = sourceRecommendations.map((recommendation) => {
+  const uniqueRecommendations = [...new Map(sourceRecommendations.map((recommendation) => [
+    normalized(`${recommendation.market}|${recommendation.recommendation}`),
+    recommendation,
+  ])).values()];
+
+  const candidates = uniqueRecommendations.map((recommendation) => {
     const market = assessMarket(input, recommendation);
+    const policy = getMarketDecisionPolicy(market.family, options.minimumExpectedValue);
     const aiConfidence = clamp(finite(recommendation.confidence) ?? 0);
-    let objectiveConfidence = clamp((quality.score * 0.4) + (market.score * 0.45) + (Math.min(aiConfidence, 90) * 0.15));
+    // Source confidence is kept only for audit. The published probability is
+    // derived exclusively from measured data quality and market evidence.
+    const rawModelConfidence = (quality.score * 0.45) + (market.score * 0.55);
+    const configuredShrinkage = Number(process.env.ANALYSIS_UNCALIBRATED_SHRINKAGE ?? 0.8);
+    const shrinkage = Number.isFinite(configuredShrinkage) ? Math.min(0.95, Math.max(0.5, configuredShrinkage)) : 0.8;
+    let objectiveConfidence = clamp(50 + ((rawModelConfidence - 50) * shrinkage));
     const rejectionReasons = market.reasons.filter((reason) =>
       /conflita|nao confirma|sem media numerica|sem historico individual|mercado nao reconhecido/.test(normalized(reason))
     );
@@ -300,14 +324,35 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any): 
       && quality.statItems.length >= 6;
 
     if (!hasRecentBase && !hasCompensatedBase) rejectionReasons.push('base historica realmente insuficiente');
-    if (quality.score < 45) rejectionReasons.push(`qualidade dos dados abaixo do minimo (${quality.score}/100)`);
-    if (market.score < 60) rejectionReasons.push(`evidencia do mercado abaixo do minimo (${market.score}/100)`);
-    if (market.confirmations.length < 2 && market.score < 75) rejectionReasons.push('mercado sem confirmacao suficiente');
+    if (quality.score < policy.minDataQuality) rejectionReasons.push(`qualidade dos dados abaixo do minimo (${quality.score}/${policy.minDataQuality})`);
+    if (market.score < policy.minMarketEvidence) rejectionReasons.push(`evidencia do mercado abaixo do minimo (${market.score}/${policy.minMarketEvidence})`);
+    if (market.confirmations.length < policy.minConfirmations) rejectionReasons.push(`mercado sem ${policy.minConfirmations} confirmacoes independentes`);
+    if (policy.requireConfirmedLineup && !input?.lineups?.confirmed) rejectionReasons.push('mercado exige escalacao confirmada');
 
     const odd = decimalOdd(recommendation);
+    const oddsValidationStatus = recommendation.meta?.oddsValidation && typeof recommendation.meta.oddsValidation === 'object'
+      ? String((recommendation.meta.oddsValidation as any).status || '')
+      : '';
+    if (options.requireRealOdds && (!odd || oddsValidationStatus !== 'matched')) {
+      rejectionReasons.push('odd real correspondente ao mercado nao encontrada');
+    }
     const expectedValue = odd ? Number((((objectiveConfidence / 100) * odd) - 1).toFixed(3)) : undefined;
-    if (expectedValue !== undefined && expectedValue <= 0) rejectionReasons.push(`valor esperado nao positivo (${expectedValue})`);
-    if (rejectionReasons.length) objectiveConfidence = Math.min(objectiveConfidence, threshold - 1);
+    const fairImpliedRaw = finite(recommendation.meta?.fairImpliedProbability);
+    const fairImpliedProbability = fairImpliedRaw !== undefined
+      ? fairImpliedRaw > 1 ? fairImpliedRaw / 100 : fairImpliedRaw
+      : undefined;
+    const probabilityEdge = fairImpliedProbability !== undefined
+      ? Number(((objectiveConfidence / 100) - fairImpliedProbability).toFixed(4))
+      : undefined;
+    if (expectedValue !== undefined && expectedValue < policy.minExpectedValue) {
+      rejectionReasons.push(`valor esperado abaixo do minimo (${expectedValue}/${policy.minExpectedValue})`);
+    }
+    if (probabilityEdge !== undefined && probabilityEdge < policy.minProbabilityEdge) {
+      rejectionReasons.push(`vantagem sobre a probabilidade justa abaixo do minimo (${probabilityEdge}/${policy.minProbabilityEdge})`);
+    }
+    const onlyWaitingForOdds = rejectionReasons.length > 0
+      && rejectionReasons.every((reason) => reason === 'odd real correspondente ao mercado nao encontrada');
+    if (rejectionReasons.length && !onlyWaitingForOdds) objectiveConfidence = Math.min(objectiveConfidence, policy.minConfidence - 1);
 
     return {
       market: recommendation.market,
@@ -320,27 +365,42 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any): 
       confirmations: market.confirmations,
       rejectionReasons: [...new Set(rejectionReasons)],
       expectedValue,
+      probabilityEdge,
+      fairImpliedProbability,
+      oddsStatus: oddsValidationStatus || 'not_checked',
+      oddsAudit: recommendation.meta?.oddsAudit,
+      policy,
       original: recommendation,
     };
   }).sort((a, b) => b.objectiveConfidence - a.objectiveConfidence || b.marketEvidence - a.marketEvidence);
 
-  const selected = candidates.find((candidate) => candidate.objectiveConfidence >= threshold && candidate.rejectionReasons.length === 0);
+  const selected = candidates.find((candidate) => candidate.objectiveConfidence >= candidate.policy.minConfidence && candidate.rejectionReasons.length === 0);
+  const waiting = !selected ? candidates.find((candidate) => (
+    candidate.objectiveConfidence >= candidate.policy.minConfidence
+    && candidate.rejectionReasons.length > 0
+    && candidate.rejectionReasons.every((reason) => reason === 'odd real correspondente ao mercado nao encontrada')
+  )) : undefined;
+  const chosen = selected || waiting;
+  const threshold = chosen?.policy.minConfidence || candidates[0]?.policy.minConfidence || 80;
   const audit: DecisionAudit = {
-    decision: selected ? 'approved' : 'rejected',
+    decision: selected ? 'approved' : waiting ? 'waiting_odds' : 'rejected',
     threshold,
     dataQuality: quality.score,
     missingData: quality.missing,
     candidates: candidates.map(({ original: _original, ...candidate }) => candidate),
-    selectedMarket: selected?.market,
-    selectedRecommendation: selected?.recommendation,
+    selectedMarket: chosen?.market,
+    selectedRecommendation: chosen?.recommendation,
     reasons: selected
       ? []
+      : waiting
+        ? ['odd real correspondente ao mercado nao encontrada; analise preservada aguardando nova coleta']
       : [...new Set(candidates.flatMap((candidate) => candidate.rejectionReasons))],
+    requireRealOdds: Boolean(options.requireRealOdds),
   };
 
   console.info('[AnalysisDecision]', JSON.stringify({ eventId: result.eventId, ...audit }));
 
-  if (!selected) {
+  if (!selected && !waiting) {
     return {
       ...result,
       market: 'none',
@@ -351,20 +411,25 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any): 
         : NO_RECOMMENDATION,
       bestEntry: undefined,
       recommendations: [],
+      analysisStatus: 'rejected',
       meta: { ...(result.meta || {}), decisionAudit: audit },
     };
   }
 
+  const effectiveSelection = selected || waiting!;
   const approvedRecommendation: BettingRecommendation = {
-    ...selected.original,
-    confidence: selected.objectiveConfidence,
-    riskLevel: selected.objectiveConfidence >= 80 ? 'baixo' : 'medio',
+    ...effectiveSelection.original,
+    confidence: effectiveSelection.objectiveConfidence,
+    riskLevel: effectiveSelection.objectiveConfidence >= 80 ? 'baixo' : 'medio',
     meta: {
-      ...(selected.original.meta || {}),
-      objectiveConfidence: selected.objectiveConfidence,
+      ...(effectiveSelection.original.meta || {}),
+      objectiveConfidence: effectiveSelection.objectiveConfidence,
       dataQuality: quality.score,
-      marketEvidence: selected.marketEvidence,
-      expectedValue: selected.expectedValue,
+      marketEvidence: effectiveSelection.marketEvidence,
+      expectedValue: effectiveSelection.expectedValue,
+      probabilityEdge: effectiveSelection.probabilityEdge,
+      fairImpliedProbability: effectiveSelection.fairImpliedProbability,
+      decisionPolicy: effectiveSelection.policy,
     },
   };
 
@@ -376,13 +441,14 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any): 
     rationale: approvedRecommendation.rationale,
     bestEntry: approvedRecommendation,
     recommendations: [approvedRecommendation],
+    analysisStatus: waiting ? 'waiting_odds' : 'approved',
     meta: { ...(result.meta || {}), decisionAudit: audit },
   };
 }
 
 // Generates market candidates exclusively from structured statistics. The LLM
 // is intentionally not involved in this decision; it only explains the result.
-export function buildStatisticalDecision(input: any, eventId: number | string): AnalysisResult {
+export function buildStatisticalDecision(input: any, eventId: number | string, options: DecisionGateOptions = {}): AnalysisResult {
   const recommendations: BettingRecommendation[] = [];
   const home = input?.teamForm?.homeRecent || {};
   const away = input?.teamForm?.awayRecent || {};
@@ -399,6 +465,35 @@ export function buildStatisticalDecision(input: any, eventId: number | string): 
   if (over25 !== undefined && over25 <= 40) recommendations.push({ market: 'Gols', recommendation: 'Under 2.5 gols', confidence: 82, rationale: `A frequência média de over 2.5 foi de apenas ${Math.round(over25)}%.`, dataSupport: [...support, `over 2.5: ${Math.round(over25)}%`] });
   if (btts !== undefined && btts >= 60) recommendations.push({ market: 'Gols', recommendation: 'Ambas as equipes marcam', confidence: 80, rationale: `BTTS ocorreu em média em ${Math.round(btts)}% da amostra recente.`, dataSupport: [...support, `BTTS: ${Math.round(btts)}%`] });
   if (btts !== undefined && btts <= 35) recommendations.push({ market: 'Gols', recommendation: 'Ambas as equipes não marcam', confidence: 80, rationale: `BTTS ocorreu em média em apenas ${Math.round(btts)}% da amostra recente.`, dataSupport: [...support, `BTTS: ${Math.round(btts)}%`] });
+
+  const homeWinRate = finite(home.winRate);
+  const awayWinRate = finite(away.winRate);
+  const homeVenueWinRate = finite(home.homePerformance?.winRate);
+  const awayVenueWinRate = finite(away.awayPerformance?.winRate);
+  const homeName = String(input?.event?.homeTeam?.name || '').trim();
+  const awayName = String(input?.event?.awayTeam?.name || '').trim();
+  if (homeName && homeWinRate !== undefined && awayWinRate !== undefined
+    && homeVenueWinRate !== undefined && awayVenueWinRate !== undefined
+    && homeWinRate - awayWinRate >= 25 && homeVenueWinRate - awayVenueWinRate >= 30) {
+    recommendations.push({
+      market: 'Resultado final',
+      recommendation: `${homeName} vence`,
+      confidence: 80,
+      rationale: `${homeName} apresenta vantagem ampla na forma recente e no recorte casa/fora.`,
+      dataSupport: [`forma geral: ${homeWinRate}% x ${awayWinRate}%`, `casa/fora: ${homeVenueWinRate}% x ${awayVenueWinRate}%`],
+    });
+  }
+  if (awayName && homeWinRate !== undefined && awayWinRate !== undefined
+    && homeVenueWinRate !== undefined && awayVenueWinRate !== undefined
+    && awayWinRate - homeWinRate >= 25 && awayVenueWinRate - homeVenueWinRate >= 30) {
+    recommendations.push({
+      market: 'Resultado final',
+      recommendation: `${awayName} vence`,
+      confidence: 80,
+      rationale: `${awayName} apresenta vantagem ampla na forma recente e no recorte casa/fora.`,
+      dataSupport: [`forma geral: ${awayWinRate}% x ${homeWinRate}%`, `fora/casa: ${awayVenueWinRate}% x ${homeVenueWinRate}%`],
+    });
+  }
 
   const pairedCandidate = (family: 'corners' | 'cards', pattern: RegExp, label: string) => {
     const item = matchingStats(input, pattern).find((stat: any) => finite(stat.home) !== undefined && finite(stat.away) !== undefined);
@@ -419,7 +514,8 @@ export function buildStatisticalDecision(input: any, eventId: number | string): 
     recommendations,
     analysisSource: 'heuristic',
   };
-  const decided = applySelectiveDecisionGate(base, input);
+  const withOdds = enrichAnalysisWithValidatedOdds(base, options.oddsResponses);
+  const decided = applySelectiveDecisionGate(withOdds, input, options);
   const audit = decided.meta?.decisionAudit as DecisionAudit | undefined;
   const selectedAudit = audit?.candidates?.find((candidate) =>
     candidate.market === decided.market && candidate.recommendation === decided.recommendation

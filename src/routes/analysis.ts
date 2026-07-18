@@ -235,6 +235,11 @@ function isTrue(value: unknown): boolean {
   return value === true || value === 'true';
 }
 
+function optionalNumber(value: unknown) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 function getTodayDate() {
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: process.env.MATCHES_TIMEZONE || 'America/Sao_Paulo',
@@ -683,6 +688,8 @@ function analysisCacheKey(eventId: string | number, options: AnalyzeOptions) {
     includeOdds: Boolean(options.includeOdds),
     useOddsFallback: Boolean(options.useOddsFallback),
     includeEnrichment: options.includeEnrichment !== false,
+    requireRealOdds: Boolean(options.requireRealOdds),
+    minimumExpectedValue: options.minimumExpectedValue,
     provider: process.env.SCORES_PROVIDER || 'sofascore',
   });
 }
@@ -715,6 +722,8 @@ function fullDailyCacheKey(date: string, options: AnalyzeOptions, config: Record
       includeOdds: Boolean(options.includeOdds),
       useOddsFallback: Boolean(options.useOddsFallback),
       includeEnrichment: options.includeEnrichment !== false,
+      requireRealOdds: Boolean(options.requireRealOdds),
+      minimumExpectedValue: options.minimumExpectedValue,
     },
     config,
     provider: process.env.SCORES_PROVIDER || 'sofascore',
@@ -1432,6 +1441,8 @@ analysisRouter.get('/analysis/full-daily', async (req, res) => {
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
       includeEnrichment: req.query.includeEnrichment !== 'false',
+      requireRealOdds: isTrue(req.query.requireRealOdds),
+      minimumExpectedValue: optionalNumber(req.query.minimumExpectedValue),
     };
     const config = {
       limit,
@@ -1597,6 +1608,8 @@ analysisRouter.get('/analysis', async (req, res) => {
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
       includeEnrichment: req.query.includeEnrichment !== 'false',
+      requireRealOdds: isTrue(req.query.requireRealOdds),
+      minimumExpectedValue: optionalNumber(req.query.minimumExpectedValue),
     });
 
     res.json({
@@ -1621,6 +1634,8 @@ analysisRouter.get('/analysis/by-teams', async (req, res) => {
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
       includeEnrichment: req.query.includeEnrichment !== 'false',
+      requireRealOdds: isTrue(req.query.requireRealOdds),
+      minimumExpectedValue: optionalNumber(req.query.minimumExpectedValue),
     };
     if (!shouldWait(req)) {
       const query = { ...req.query };
@@ -1769,6 +1784,8 @@ analysisRouter.get('/analysis/:eventId', async (req, res) => {
       includeOdds: isTrue(req.query.includeOdds),
       useOddsFallback: isTrue(req.query.useOddsFallback),
       includeEnrichment: req.query.includeEnrichment !== 'false',
+      requireRealOdds: isTrue(req.query.requireRealOdds),
+      minimumExpectedValue: optionalNumber(req.query.minimumExpectedValue),
     };
     const cached = getCachedAnalysis(eventId, options);
     if (cached) {

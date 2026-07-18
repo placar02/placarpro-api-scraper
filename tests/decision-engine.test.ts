@@ -105,7 +105,7 @@ describe('motor seletivo de analise', () => {
     expect((gated.meta?.decisionAudit as any).decision).toBe('approved');
   });
 
-  it('aprova analise moderada mesmo sem dados opcionais', () => {
+  it('rejeita analise moderada sem qualidade minima', () => {
     const input: any = strongInput();
     input.teamForm.homeRecent.played = 3;
     input.teamForm.awayRecent.played = 3;
@@ -119,10 +119,57 @@ describe('motor seletivo de analise', () => {
 
     const gated = applySelectiveDecisionGate(result(), input);
 
-    expect(gated.recommendation).toBe('Over 2.5 gols');
-    expect(gated.confidence).toBeGreaterThanOrEqual(68);
-    expect((gated.meta?.decisionAudit as any).decision).toBe('approved');
+    expect(gated.recommendation).toBe(NO_RECOMMENDATION);
+    expect(gated.confidence).toBe(0);
+    expect((gated.meta?.decisionAudit as any).decision).toBe('rejected');
     expect((gated.meta?.decisionAudit as any).missingData).toContain('arbitro');
+  });
+
+  it('preserva a analise como waiting odds quando o modo estrito nao encontra cotacao', () => {
+    const gated = applySelectiveDecisionGate(result(), strongInput(), { requireRealOdds: true });
+
+    expect(gated.recommendation).toBe('Over 2.5 gols');
+    expect(gated.analysisStatus).toBe('waiting_odds');
+    expect((gated.meta?.decisionAudit as any).decision).toBe('waiting_odds');
+    expect((gated.meta?.decisionAudit as any).reasons[0]).toContain('odd real correspondente');
+  });
+
+  it('aprova odd validada somente com EV e vantagem suficientes', () => {
+    const candidate = result();
+    candidate.recommendations![0].meta = {
+      decimal_odds: 1.8,
+      fairImpliedProbability: 58,
+      oddsValidation: { status: 'matched' },
+    };
+    const gated = applySelectiveDecisionGate(candidate, strongInput(), { requireRealOdds: true, minimumExpectedValue: 0.05 });
+
+    expect(gated.recommendation).toBe('Over 2.5 gols');
+    expect(gated.bestEntry?.meta?.expectedValue).toBeGreaterThanOrEqual(0.05);
+    expect(gated.bestEntry?.meta?.probabilityEdge).toBeGreaterThanOrEqual(0.03);
+  });
+
+  it('rejeita de verdade quando a odd existe mas o EV e insuficiente', () => {
+    const candidate = result();
+    candidate.recommendations![0].meta = {
+      decimal_odds: 1.1,
+      fairImpliedProbability: 90,
+      oddsValidation: { status: 'matched' },
+    };
+    const gated = applySelectiveDecisionGate(candidate, strongInput(), { requireRealOdds: true, minimumExpectedValue: 0.05 });
+
+    expect(gated.analysisStatus).toBe('rejected');
+    expect((gated.meta?.decisionAudit as any).decision).toBe('rejected');
+    expect((gated.meta?.decisionAudit as any).reasons.join(' ')).toContain('valor esperado abaixo do minimo');
+  });
+
+  it('nao utiliza a confianca da IA na probabilidade objetiva', () => {
+    const lowSource = result();
+    const highSource = result();
+    lowSource.recommendations![0].confidence = 20;
+    highSource.recommendations![0].confidence = 95;
+
+    expect(applySelectiveDecisionGate(lowSource, strongInput()).confidence)
+      .toBe(applySelectiveDecisionGate(highSource, strongInput()).confidence);
   });
 
   it('rejeita um under quando a tendencia recente aponta para over', () => {

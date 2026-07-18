@@ -6,6 +6,7 @@ import { fetchLineups } from '../scrapers/lineups';
 import { fetchOdds } from '../scrapers/odds';
 import { fetchOgolIncidents, fetchOgolLineups, fetchOgolOdds, fetchOgolStatistics, fetchOgolStreaks } from '../scrapers/ogol';
 import { fetch365Enrichment } from '../scrapers/scores365-enrichment';
+import { fetch365Odds } from '../scrapers/scores365';
 import { fetchStatistics } from '../scrapers/statistics';
 import { fetchStreaks } from '../scrapers/streaks';
 import { fetchTopPlayers } from '../scrapers/top-players';
@@ -1184,6 +1185,8 @@ export function buildExplanationInput(input: LLMAnalysisInput, decision: Analysi
       tournament: { name: input.event?.tournament?.name },
       startTimestamp: input.event?.startTimestamp,
       status: input.event?.status,
+      round: input.event?.round ?? input.event?.roundInfo?.round,
+      venue: input.event?.venue?.name ? { name: input.event.venue.name, city: input.event.venue.city } : undefined,
     },
     teamForm: {
       homeRecent: compactForm(input.teamForm?.homeRecent),
@@ -1201,6 +1204,10 @@ export function buildExplanationInput(input: LLMAnalysisInput, decision: Analysi
       recommendation: decision.recommendation,
       confidence: decision.confidence,
       approved: audit?.decision === 'approved',
+      decisionStatus: audit?.decision || decision.analysisStatus,
+      odd: decision.bestEntry?.meta?.decimal_odds,
+      expectedValue: decision.bestEntry?.meta?.expectedValue,
+      riskLevel: decision.bestEntry?.riskLevel,
       confirmations: audit?.candidates?.[0]?.confirmations || [],
       risks: audit?.reasons || audit?.missingData || [],
     },
@@ -1368,12 +1375,20 @@ Odds nunca criam a recomendacao; quando existirem, servem apenas para validar EV
 Se dados forem insuficientes ou conflitantes, retorne recommendations=[] e bestRecommendation=null.
 Responda somente JSON valido com: matchAnalysis, dataCoverage, keyFactors, homeAnalysis, awayAnalysis, refereeAnalysis, playerAnalysis, marketBreakdown, recommendations, bestRecommendation, confidenceDrivers, avoidMarkets e riskAnalysis.
 Cada recommendation deve ter market, recommendation, confidence de 0 a 100, riskLevel, dataSupport, warningSigns e rationale.`;
-    const explanationPrompt = `Voce apenas explica uma decisao ja tomada pelo motor estatistico do backend.
-Nao altere mercado, recomendacao ou confianca de backendDecision e nao crie outra entrada.
-Use somente o resumo recebido. Nao invente dados nem mencione jogadores ou desfalques.
-Se backendDecision.approved=false, explique objetivamente por que nao houve entrada.
-Responda somente JSON valido com: matchAnalysis, keyFactors (maximo 3), marketBreakdown, riskAnalysis e bestRecommendation.
-bestRecommendation deve copiar exatamente market, recommendation e confidence de backendDecision, adicionando apenas rationale, dataSupport e warningSigns.`;
+    const explanationPrompt = `Voce e o redator esportivo do PlacarPro e apenas explica uma decisao ja tomada pelo motor estatistico do backend.
+Nao altere mercado, recomendacao, confianca, odd, risco, EV ou status de backendDecision. Nao crie outra entrada.
+Use linguagem simples, objetiva e profissional para uma pessoa sem conhecimento avancado em estatistica.
+Use somente os dados recebidos. Nao invente numeros, contexto, jogadores, desfalques, importancia da partida ou estilo de jogo.
+Transforme indicadores tecnicos em frases naturais. Evite listas de numeros sem explicar o que representam.
+rationale deve ser um resumo da IA de 4 a 8 linhas: explique a recomendacao, comportamento esperado, indicadores decisivos e por que foi o melhor mercado.
+matchAnalysis deve explicar o contexto disponivel: momento das equipes, forma recente, mando e caracteristicas do confronto. Quando um aspecto nao estiver nos dados, nao o mencione.
+keyFactors deve conter de 3 a 5 evidencias curtas, completas e compreensiveis.
+marketBreakdown deve ter a chave whyThisMarket com uma explicacao sobre a combinacao entre probabilidade estatistica, qualidade dos dados e EV, sem afirmar que o EV foi positivo se ele estiver ausente.
+riskAnalysis deve sempre apresentar os riscos reais ou as limitacoes dos dados. Nunca esconda incertezas.
+bestRecommendation deve copiar exatamente market, recommendation e confidence de backendDecision, adicionando apenas rationale, dataSupport em frases naturais e warningSigns.
+Se decisionStatus=waiting_odds, explique que a analise esportiva foi preservada, mas ainda nao existe cotacao real para validar o EV.
+Se decisionStatus=rejected, explique objetivamente por que nao houve entrada.
+Responda somente JSON valido com: matchAnalysis, keyFactors, marketBreakdown, riskAnalysis e bestRecommendation.`;
     const requestInput = isReasoningModel ? compactReasoningInput(input) : input;
     const requestPrompt = input.explanationOnly ? explanationPrompt : isReasoningModel ? reasoningPrompt : prompt;
     const serializedInput = JSON.stringify(requestInput);
@@ -1721,6 +1736,10 @@ function attachEventPresentation(result: AnalysisResult, event: any, lineups?: a
     } : result.awayTeam,
     tournamentName: event?.tournament?.name || result.tournamentName,
     startTimestamp: event?.startTimestamp ?? event?.startTime ?? result.startTimestamp,
+    round: event?.round ?? event?.roundInfo?.round ?? result.round,
+    venue: event?.venue?.name && !/^unknown$/i.test(String(event.venue.name))
+      ? { id: event.venue.id, name: event.venue.name, city: event.venue.city }
+      : result.venue,
   };
 }
 
@@ -1732,6 +1751,8 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
     includeOdds = false,
     useOddsFallback = false,
     includeEnrichment = true,
+    requireRealOdds = false,
+    minimumExpectedValue,
   } = options;
   const eventResp = await fetchEvent(eventId).catch((err) => {
     if (err instanceof SofaScoreBlockedError) {
@@ -1766,11 +1787,17 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
   const is365ScoresProvider = process.env.SCORES_PROVIDER === '365scores';
   const isAiScoreProvider = process.env.SCORES_PROVIDER === 'aiscore';
   const isOgolProvider = process.env.SCORES_PROVIDER === 'ogol';
-  const shouldUseOdds = !is365ScoresProvider && (includeOdds || useOddsFallback);
+  const shouldUseOdds = includeOdds || useOddsFallback || requireRealOdds;
   const needsDeepData = useLLM;
   const [oddsResp, statisticsResp, incidentsResp, lineupsResp, streaksResp, topPlayersResp, scores365Resp] = await Promise.all([
     shouldUseOdds
-      ? safeFetch('odds', () => isAiScoreProvider ? fetchAiScoreOdds(eventId) : isOgolProvider ? fetchOgolOdds(eventId) : fetchOdds(eventId, 1))
+      ? safeFetch('odds', () => is365ScoresProvider
+        ? fetch365Odds(eventId)
+        : isAiScoreProvider
+          ? fetchAiScoreOdds(eventId)
+          : isOgolProvider
+            ? fetchOgolOdds(eventId)
+            : fetchOdds(eventId, 1))
       : Promise.resolve(null),
     needsDeepData && !is365ScoresProvider
       ? safeFetch('statistics', () => isAiScoreProvider ? fetchAiScoreStatistics(eventId) : isOgolProvider ? fetchOgolStatistics(eventId) : fetchStatistics(eventId))
@@ -1785,7 +1812,7 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
       ? safeFetch('streaks', () => isAiScoreProvider ? fetchAiScoreStreaks(String(eventId)) : isOgolProvider ? fetchOgolStreaks(String(eventId)) : fetchStreaks(String(eventId)))
       : Promise.resolve(null),
     useLLM && !is365ScoresProvider && !isAiScoreProvider && !isOgolProvider ? fetchTopPlayersForEvent(event) : Promise.resolve(null),
-    useLLM && includeEnrichment && !is365ScoresProvider && !isOgolProvider ? safeFetch('365Scores enrichment', () => fetch365Enrichment(event)) : Promise.resolve(null),
+    useLLM && includeEnrichment && !is365ScoresProvider ? safeFetch('365Scores enrichment', () => fetch365Enrichment(event)) : Promise.resolve(null),
   ]);
   let llmError: string | undefined;
 
@@ -1800,7 +1827,19 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
       topPlayersResp,
       scores365Resp
     );
-    const statisticalDecision = buildStatisticalDecision(fullInput, event.id ?? eventId);
+    const statisticalDecision = buildStatisticalDecision(fullInput, event.id ?? eventId, {
+      requireRealOdds,
+      minimumExpectedValue,
+      oddsResponses: [
+        oddsResp || {
+          source: is365ScoresProvider ? '365scores' : isAiScoreProvider ? 'aiscore' : isOgolProvider ? 'ogol' : 'sofascore',
+          unavailableReason: shouldUseOdds ? 'A fonte principal nao retornou mercados de odds.' : 'A coleta de odds nao foi solicitada.',
+        },
+        scores365Resp?.available
+          ? scores365Resp.odds
+          : { source: '365scores', unavailableReason: scores365Resp?.reason || 'Enriquecimento alternativo nao retornou uma partida correspondente.' },
+      ],
+    });
     const decisionAudit = statisticalDecision.meta?.decisionAudit as any;
 
     // By default rejected matches do not consume Azure quota. Manual searches can
