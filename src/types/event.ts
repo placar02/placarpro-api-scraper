@@ -227,6 +227,7 @@ export interface EventApiResponse {
 
 export interface NormalizedEvent {
   id: number;
+  sourceProvider?: 'sofascore' | 'ogol' | '365scores' | 'aiscore';
   slug: string;
   status: {
     code: number;

@@ -167,8 +167,11 @@ function dataQuality(input: any) {
   if (input?.statistics?.context?.competitionTable?.home || input?.statistics?.context?.teamNeeds?.home) score += 3;
   else missing.push('contexto_do_campeonato');
 
+  const sourceConsensusBonus = Math.min(3, Math.max(0, finite(input?.dataQuality?.sourceConsensus?.confidenceBonus) || 0));
   return {
-    score: clamp(score),
+    score: clamp(score + sourceConsensusBonus),
+    baseScore: clamp(score),
+    sourceConsensusBonus,
     missing,
     homeMatches,
     awayMatches,
@@ -362,7 +365,10 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any, o
       objectiveConfidence,
       dataQuality: quality.score,
       marketEvidence: market.score,
-      confirmations: market.confirmations,
+      confirmations: [
+        ...market.confirmations,
+        ...(quality.sourceConsensusBonus > 0 ? [`dados corroborados por ${input?.dataQuality?.sourceConsensus?.providerCount || 2} fontes`] : []),
+      ],
       rejectionReasons: [...new Set(rejectionReasons)],
       expectedValue,
       probabilityEdge,

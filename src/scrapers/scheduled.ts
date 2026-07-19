@@ -1,5 +1,6 @@
 import { chromium, Browser } from 'playwright';
 import type { EventLive } from '../types/event.live';
+import { registerEventSource } from '../providers/event-source-registry';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36';
 const BASE_URL = process.env.SOFASCORE_BASE_URL || 'https://sofascore.com/api/v1';
@@ -47,8 +48,8 @@ async function launchSofascoreBrowser(): Promise<Browser> {
   return chromium.launch(launchOptions);
 }
 
-export async function fetchScheduledMatches(date: string, retryOn403 = true): Promise<ScheduledMatchesResponse> {
-  const cacheKey = `${date}:${retryOn403 ? 'retry' : 'no-retry'}:${SOFASCORE_PROXY_URL || 'no-proxy'}`;
+export async function fetchScheduledMatches(date: string, retryOn403 = true, allowProviderFallback = true): Promise<ScheduledMatchesResponse> {
+  const cacheKey = `${date}:${retryOn403 ? 'retry' : 'no-retry'}:${allowProviderFallback ? 'fallback' : 'strict'}:${SOFASCORE_PROXY_URL || 'no-proxy'}`;
   const cached = scheduleCache.get(cacheKey);
 
   if (cached && cached.expiresAt > Date.now()) {
@@ -56,6 +57,34 @@ export async function fetchScheduledMatches(date: string, retryOn403 = true): Pr
   }
 
   const promise = fetchScheduledMatchesUncached(date, retryOn403)
+    .then(async (result) => {
+      if (result.events?.length) {
+        registerEventSource(result.events, 'sofascore');
+        return result;
+      }
+      if (!allowProviderFallback) return result;
+      try {
+        const { fetchOgolMatches } = await import('./ogol');
+        const ogol = await fetchOgolMatches(date);
+        if (ogol.events?.length) {
+          registerEventSource(ogol.events, 'ogol');
+          return { status: 200, events: ogol.events, raw: { source: 'ogol-fallback', primaryFailure: result.raw, providerPayload: ogol.raw } };
+        }
+      } catch (error) {
+        console.warn(`[ProviderFallback] OGOL agenda ${date}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      try {
+        const { fetch365Matches } = await import('./scores365');
+        const scores365 = await fetch365Matches(date);
+        if (scores365.events?.length) {
+          registerEventSource(scores365.events, '365scores');
+          return { status: 200, events: scores365.events, raw: { source: '365scores-fallback', primaryFailure: result.raw, providerPayload: scores365.raw } };
+        }
+      } catch (error) {
+        console.warn(`[ProviderFallback] 365Scores agenda ${date}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return result;
+    })
     .finally(() => {
       const current = scheduleCache.get(cacheKey);
       if (current?.promise === promise && current.expiresAt <= Date.now()) {

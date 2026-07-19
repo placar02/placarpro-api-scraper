@@ -16,6 +16,7 @@ import { teamsRouter } from './routes/teams';
 import { teamEventsRouter } from './routes/team-events';
 import { topPlayersRouter } from './routes/top-players';
 import { analysisRouter } from './routes/analysis';
+import { enrichmentRouter } from './routes/enrichment';
 import cors from "cors";
 
 const PORT = process.env.PORT || 3001;
@@ -45,6 +46,7 @@ app.use('/', lineupsRouter);
 app.use('/', imagesRouter);
 app.use('/', searchRouter);
 app.use('/', analysisRouter);
+app.use('/', enrichmentRouter);
 app.use('/team', teamsRouter);
 app.use('/team', teamEventsRouter);
 app.use('/team', topPlayersRouter);

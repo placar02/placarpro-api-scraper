@@ -90,6 +90,7 @@ export type TimeInfo = {
 
 export type EventLive = {
   id: number;
+  sourceProvider?: 'sofascore' | 'ogol' | '365scores' | 'aiscore';
   customId: string;
   slug: string;
   startTimestamp: number;

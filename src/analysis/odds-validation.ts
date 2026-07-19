@@ -58,6 +58,11 @@ function flattenProviderOdds(response: any) {
   const candidates: OddsCandidate[] = [];
   const discarded: OddsDiscard[] = [];
   const source = String(response?.source || response?.summary?.source || response?.provider || 'odds-provider');
+  const defaultBookmaker = String(response?.bookmaker || '') || undefined;
+  const capturedAt = firstValue(response, ['scraped_at', 'updated_at', 'capturedAt']);
+  const maxAgeMs = Math.max(60000, Number(process.env.ODDS_MAX_AGE_MS || 15 * 60 * 1000));
+  const capturedTime = capturedAt ? Date.parse(String(capturedAt)) : NaN;
+  const stale = Number.isFinite(capturedTime) && Date.now() - capturedTime > maxAgeMs;
 
   for (const collection of marketCollections(response)) {
     for (const market of collection.markets) {
@@ -80,13 +85,18 @@ function flattenProviderOdds(response: any) {
       for (const { choice, odd } of validChoices) {
         const choiceName = String(firstValue(choice, ['name', 'raw_name', 'rawName', 'label', 'displayName', 'title', 'slip_content', 'slipContent', 'selectionName']) || '');
         const normalized = normalizeMarket({ marketName, marketPeriod, choiceGroup, choiceName });
+        const bookmaker = firstValue(choice, ['bookmaker', 'bookmakerName']) || market?.bookmaker?.name || market?.bookmaker || defaultBookmaker;
+        if (stale) {
+          discarded.push({ source, bookmaker, originalMarket: marketName, originalChoice: choiceName, normalizedMarket: normalized.key, decimalOdd: odd, reason: `odd expirada: coleta excedeu ${Math.round(maxAgeMs / 60000)} minutos` });
+          continue;
+        }
         if (!odd) {
-          discarded.push({ source, bookmaker: firstValue(choice, ['bookmaker', 'bookmakerName']) || market?.bookmaker, originalMarket: marketName, originalChoice: choiceName, normalizedMarket: normalized.key, reason: 'odd decimal ausente, invalida ou menor ou igual a 1' });
+          discarded.push({ source, bookmaker, originalMarket: marketName, originalChoice: choiceName, normalizedMarket: normalized.key, reason: 'odd decimal ausente, invalida ou menor ou igual a 1' });
           continue;
         }
         candidates.push({
           source,
-          bookmaker: firstValue(choice, ['bookmaker', 'bookmakerName']) || market?.bookmaker?.name || market?.bookmaker,
+          bookmaker,
           marketName,
           marketPeriod,
           choiceGroup,
@@ -94,7 +104,7 @@ function flattenProviderOdds(response: any) {
           decimalOdd: odd,
           marketOverround: overround > 0 ? Number(overround.toFixed(4)) : undefined,
           fairImpliedProbability: overround > 0 ? Number(((1 / odd) / overround).toFixed(4)) : undefined,
-          capturedAt: firstValue(response, ['scraped_at', 'updated_at', 'capturedAt']),
+          capturedAt,
           normalized,
         });
       }
@@ -164,6 +174,8 @@ export function enrichRecommendationWithValidatedOdds(recommendation: BettingRec
       originalChoice: item.candidate.choiceName,
       normalizedMarket: item.candidate.normalized.key,
       decimalOdd: item.candidate.decimalOdd,
+      capturedAt: item.candidate.capturedAt,
+      line: item.candidate.normalized.line,
       reason: item.reason,
     })),
   ];
@@ -200,6 +212,8 @@ export function enrichRecommendationWithValidatedOdds(recommendation: BettingRec
       originalChoice: best.candidate.choiceName,
       normalizedMarket: best.candidate.normalized.key,
       decimalOdd: best.candidate.decimalOdd,
+      capturedAt: best.candidate.capturedAt,
+      line: best.candidate.normalized.line,
       matchStage: best.stage,
     } : undefined,
     rejectionReason: best ? undefined : candidates.length

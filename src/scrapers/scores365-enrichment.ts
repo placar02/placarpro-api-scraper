@@ -1,5 +1,6 @@
 import type { NormalizedEvent } from '../types/event';
 import type { EventLive } from '../types/event.live';
+import type { DatasetProvenance, NormalizedMatchEnrichment, NormalizedMetric } from '../providers/contracts';
 import {
   fetch365Event,
   fetch365Graph,
@@ -179,5 +180,88 @@ export async function fetch365Enrichment(event: NormalizedEvent) {
       hasStreaks: Boolean((streaks as any)?.data?.general?.length || (streaks as any)?.data?.head2head?.length),
       hasGraph: Boolean((graph as any)?.data?.points?.length),
     },
+  };
+}
+
+function finite(value: unknown): number | undefined {
+  if (value === null || value === undefined || value === '') return undefined;
+  const parsed = Number(String(value).replace(',', '.').replace(/[^\d.-]/g, ''));
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function normalized365Metrics(statistics: any): NormalizedMetric[] {
+  return (Object.values(statistics?.by_period || {}) as any[]).flatMap((period) => (
+    Object.values(period?.groups_by_name || {}) as any[]
+  ).flatMap((group) => (group?.items || []).map((item: any) => ({
+    key: String(item.key || item.name || 'metric'),
+    name: String(item.name || item.key || 'Metrica'),
+    period: String(period.period || 'ALL'),
+    group: String(group.group_name || '365Scores'),
+    home: finite(item.home ?? item.homeValue),
+    away: finite(item.away ?? item.awayValue),
+    homeLabel: item.home !== undefined ? String(item.home) : undefined,
+    awayLabel: item.away !== undefined ? String(item.away) : undefined,
+    source: '365scores',
+  }))));
+}
+
+function normalized365Player(entry: any) {
+  const player = entry?.player || entry;
+  return {
+    id: player?.id, name: player?.name || player?.shortName, shortName: player?.shortName,
+    position: entry?.position || player?.position, shirtNumber: entry?.shirtNumber || player?.jerseyNumber,
+    substitute: Boolean(entry?.substitute), captain: Boolean(entry?.captain),
+    statistics: entry?.statistics || entry?.stats, source: '365scores',
+  };
+}
+
+export function normalize365Enrichment(payload: any, event: NormalizedEvent): NormalizedMatchEnrichment {
+  const provenance: Record<string, DatasetProvenance> = {};
+  for (const [key, available] of Object.entries(payload?.dataCoverage || {})) {
+    provenance[key] = { source: '365scores', status: available ? 'available' : 'empty' };
+  }
+  if (!payload?.available) {
+    return {
+      provider: '365scores', available: false, reason: payload?.reason || 'provider indisponivel', metrics: [],
+      lineups: { confirmed: false, home: { starters: [], substitutes: [] }, away: { starters: [], substitutes: [] } },
+      incidents: [], shots: [], playerStatistics: [], averagePositions: [], bestPlayers: [],
+      teams: { home: { topPlayers: [], squad: [], missingPlayers: [] }, away: { topPlayers: [], squad: [], missingPlayers: [] } },
+      context: {}, provenance, collectedAt: new Date().toISOString(), raw: payload,
+    };
+  }
+  const lineups = payload.lineups?.data || {};
+  const side = (name: 'home' | 'away') => {
+    const players = lineups?.[name]?.players || [];
+    return {
+      starters: players.filter((item: any) => !item.substitute).map(normalized365Player),
+      substitutes: players.filter((item: any) => item.substitute).map(normalized365Player),
+    };
+  };
+  const home = side('home'); const away = side('away');
+  const statisticalPlayers = payload.statistics?.players || [];
+  return {
+    provider: '365scores', available: true, providerEventId: payload.scores365EventId,
+    matchedEvent: { ...(payload.matchedEvent || {}), matchSearch: payload.matchSearch },
+    metrics: normalized365Metrics(payload.statistics),
+    lineups: { confirmed: Boolean(lineups.confirmed), home, away },
+    incidents: (payload.incidents?.data?.incidents || []).map((item: any) => ({ ...item, source: '365scores' })),
+    shots: (payload.statistics?.shotChart || []).map((item: any) => ({ ...item, source: '365scores' })),
+    playerStatistics: statisticalPlayers.map((item: any) => ({ ...normalized365Player(item), ...item, source: '365scores' })),
+    averagePositions: [], bestPlayers: statisticalPlayers.slice(0, 30), odds: payload.odds,
+    teams: {
+      home: { id: event.homeTeam?.id, name: event.homeTeam?.name, topPlayers: statisticalPlayers.slice(0, 15), squad: [...home.starters, ...home.substitutes], missingPlayers: (lineups?.home?.missingPlayers || []).map(normalized365Player) },
+      away: { id: event.awayTeam?.id, name: event.awayTeam?.name, topPlayers: statisticalPlayers.slice(15, 30), squad: [...away.starters, ...away.substitutes], missingPlayers: (lineups?.away?.missingPlayers || []).map(normalized365Player) },
+    },
+    context: {
+      referee: payload.matchedEvent?.referee,
+      venue: payload.matchedEvent?.venue,
+      round: payload.matchedEvent?.round,
+      phase: payload.matchedEvent?.tournament?.name,
+    },
+    graph: payload.graph?.data,
+    streaks: payload.streaks?.data,
+    provenance,
+    collectedAt: new Date().toISOString(),
+    raw: payload,
   };
 }

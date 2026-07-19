@@ -125,6 +125,19 @@ describe('motor seletivo de analise', () => {
     expect((gated.meta?.decisionAudit as any).missingData).toContain('arbitro');
   });
 
+  it('limita o bonus de consenso entre fontes sem alterar os limiares do mercado', () => {
+    const input: any = strongInput();
+    input.dataQuality = { sourceConsensus: { confidenceBonus: 99, providerCount: 3 } };
+    const baseline = applySelectiveDecisionGate(result(), strongInput());
+    const corroborated = applySelectiveDecisionGate(result(), input);
+    const baselineAudit = baseline.meta?.decisionAudit as any;
+    const corroboratedAudit = corroborated.meta?.decisionAudit as any;
+
+    expect(corroboratedAudit.dataQuality - baselineAudit.dataQuality).toBe(3);
+    expect(corroboratedAudit.candidates[0].confirmations).toContain('dados corroborados por 3 fontes');
+    expect(corroboratedAudit.candidates[0].policy).toEqual(baselineAudit.candidates[0].policy);
+  });
+
   it('preserva a analise como waiting odds quando o modo estrito nao encontra cotacao', () => {
     const gated = applySelectiveDecisionGate(result(), strongInput(), { requireRealOdds: true });
 

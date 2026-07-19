@@ -5,12 +5,16 @@ import { fetchIncidents } from '../scrapers/incidents';
 import { fetchLineups } from '../scrapers/lineups';
 import { fetchOdds } from '../scrapers/odds';
 import { fetchOgolIncidents, fetchOgolLineups, fetchOgolOdds, fetchOgolStatistics, fetchOgolStreaks } from '../scrapers/ogol';
-import { fetch365Enrichment } from '../scrapers/scores365-enrichment';
+import { fetch365Enrichment, normalize365Enrichment } from '../scrapers/scores365-enrichment';
 import { fetch365Odds } from '../scrapers/scores365';
+import { betanoOddsEnabled, fetchBetanoOddsForMatch } from '../scrapers/betano-odds';
+import { collectSupplementalEnrichment } from '../providers/enrichment';
+import { fetchSofaScoreEnrichmentByProviderEvent } from '../scrapers/sofascore';
 import { fetchStatistics } from '../scrapers/statistics';
 import { fetchStreaks } from '../scrapers/streaks';
 import { fetchTopPlayers } from '../scrapers/top-players';
 import { applySelectiveDecisionGate, buildStatisticalDecision, normalizeUnavailableData, NO_RECOMMENDATION, OPTIONAL_DATA_UNAVAILABLE } from './decision-engine';
+import { mergeEnrichmentIntoAnalysisInput } from './enrichment-merge';
 import type { AnalysisResult, AnalyzeOptions, BettingRecommendation } from '../types/analysis';
 
 interface LLMAnalysisInput {
@@ -24,6 +28,9 @@ interface LLMAnalysisInput {
   refereeProfile?: any;
   playerProps?: any;
   scores365?: any;
+  sofascore?: any;
+  ogol?: any;
+  dataProviders?: any;
   teamForm?: any;
   dataQuality?: any;
   backendDecision?: any;
@@ -993,7 +1000,7 @@ function buildLLMInput(event: any, oddsResp: any, statisticsResp: any, incidents
 
   const sourceEvent = event?.raw?.event || event?.data || event;
   const normalizedEvent = sourceEvent.event || sourceEvent;
-  const source = process.env.SCORES_PROVIDER || 'sofascore';
+  const source = normalizedEvent.sourceProvider || process.env.SCORES_PROVIDER || 'sofascore';
   const teamForm = buildTeamFormSummary(streaksResp, statisticsResp, incidentsResp, normalizedEvent);
   const scores365 = summarize365Enrichment(scores365Resp);
   const ownDiscipline = teamForm.disciplineAndCorners;
@@ -1156,9 +1163,10 @@ function compactForm(form: any) {
     bttsRate: sample.bttsRate, over25Rate: sample.over25Rate,
   } : undefined;
   return {
-    last5: pick(form.last5),
-    last10: pick(form.last10 || form),
-    sequence: limitArray(form.recentMatches, 5).map((match: any) => match.result).filter(Boolean).join('-') || undefined,
+    last5: pick(form.samples?.last5 || form.last5),
+    last10: pick(form.samples?.last10 || form.last10 || form),
+    last15: pick(form.samples?.last15 || form.last15),
+    sequence: limitArray(form.recentMatches || form.events, 5).map((match: any) => match.result || match.status).filter(Boolean).join('-') || undefined,
     home: pick(form.homePerformance),
     away: pick(form.awayPerformance),
   };
@@ -1199,6 +1207,11 @@ export function buildExplanationInput(input: LLMAnalysisInput, decision: Analysi
     },
     statistics: { main: statistics },
     dataQuality: input.dataQuality,
+    dataProviders: Object.fromEntries(Object.entries(input.dataProviders || {}).map(([provider, value]: [string, any]) => [provider, {
+      available: value?.available,
+      providerEventId: value?.providerEventId,
+      datasets: Object.fromEntries(Object.entries(value?.provenance || {}).map(([key, dataset]: [string, any]) => [key, dataset?.status])),
+    }])),
     backendDecision: {
       market: decision.market,
       recommendation: decision.recommendation,
@@ -1260,6 +1273,10 @@ Na fonte ogol, quando event.status.type="inprogress", minuto, placar e estatisti
 Quando scores365.available=true, use scores365 como fonte complementar para estatisticas, odds reais, escanteios quando houver, cartoes, lineups, incidentes, streaks, placar/status e dados ao vivo. Cite scores365.scores365EventId e os campos concretos usados quando eles ajudarem a justificar a entrada.
 Se 365Scores nao encontrar correspondencia confiavel ou algum endpoint publico nao retornar dados, diga isso em dataCoverage.missingData, mas continue usando AiScore e os demais dados disponiveis.
 Use apenas os campos retornados em scores365.statistics, scores365.incidents, scores365.lineups, scores365.streaks e scores365.odds. Se um bloco estiver ausente, nao invente; escreva exatamente "Dado não disponível." para o mercado afetado.
+O SofaScore e a fonte principal de identidade da partida, agenda e dados esportivos. Use seus dados de evento, statistics, teamForm, lineups, jogadores, classificacao, arbitro, estadio e clima antes das fontes secundarias.
+Quando ogol.available=true, use ogol como fonte secundaria para preencher lacunas e validar forma, contexto de campeonato, ultimos titulares, desfalques, estatisticas e odds. Quando scores365.available=true, use 365Scores como segunda fonte secundaria para estatisticas, odds, incidentes e escalações.
+dataProviders contem os payloads normalizados por fonte e dataQuality.sourceConsensus informa cobertura corroborada. Consenso significa que duas fontes possuem cobertura independente do mesmo conjunto; nao significa que valores divergentes sejam iguais. Nunca esconda divergencias e nunca aumente a confianca alem da probabilidade objetiva calculada pelo backend.
+Use apenas datasets com provenance.status="available". Se SofaScore, OGOL ou 365Scores falhar, continue com as fontes restantes e nao transforme ausencia de dados em sinal esportivo.
 Na fonte aiscore, use obrigatoriamente teamForm.homeRecent, teamForm.awayRecent, teamForm.headToHead, teamForm.disciplineAndCorners e lineups antes de dizer que faltam dados. Esses blocos resumem ultimas partidas, gols pro/contra, BTTS, over 2.5, clean sheets, posicao recente no campeonato, elenco, desfalques e estatisticas de jogo quando disponiveis.
 Para cartoes e escanteios, primeiro procure em teamForm.disciplineAndCorners.cardsFromStats, cardsFromIncidents, cornersFromStats, foulsFromStats e statistics.teamPeriods. Se existir qualquer valor concreto, faca uma leitura tecnica com cautela. So diga que nao ha dado concreto quando esses campos tambem estiverem vazios.
 Nao coloque "cartoes" ou "escanteios" em avoidMarkets apenas porque uma fonte secundaria nao retornou dados; se AiScore ou 365Scores tiver stats/incidentes ou historico suficiente, use esses dados. Se realmente nao houver dado numerico, diga a limitacao dentro de marketBreakdown sem transformar isso em entrada principal.
@@ -1279,13 +1296,15 @@ Analise todos os mercados suportados, mas retorne no maximo 3 candidatos realmen
 Retorne APENAS um JSON valido neste formato:
 {
   "dataCoverage": {
-    "source": "aiscore, 365scores, ogol ou sofascore",
+    "source": "fontes efetivamente utilizadas: ogol, 365scores, sofascore ou aiscore",
     "hasLineups": true,
     "hasTopPerformers": true,
     "hasPlayerProps": true,
     "hasShotChart": true,
     "hasStatistics": true,
     "has365Scores": true,
+    "hasSofaScore": true,
+    "hasOgol": true,
     "hasReferee": true,
     "missingData": ["dados ausentes que limitam a analise"]
   },
@@ -1784,12 +1803,13 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
   }
 
   const event = eventResp.data;
-  const is365ScoresProvider = process.env.SCORES_PROVIDER === '365scores';
-  const isAiScoreProvider = process.env.SCORES_PROVIDER === 'aiscore';
-  const isOgolProvider = process.env.SCORES_PROVIDER === 'ogol';
+  const effectiveProvider = event.sourceProvider || process.env.SCORES_PROVIDER || 'sofascore';
+  const is365ScoresProvider = effectiveProvider === '365scores';
+  const isAiScoreProvider = effectiveProvider === 'aiscore';
+  const isOgolProvider = effectiveProvider === 'ogol';
   const shouldUseOdds = includeOdds || useOddsFallback || requireRealOdds;
   const needsDeepData = useLLM;
-  const [oddsResp, statisticsResp, incidentsResp, lineupsResp, streaksResp, topPlayersResp, scores365Resp] = await Promise.all([
+  const [oddsResp, statisticsResp, incidentsResp, lineupsResp, streaksResp, topPlayersResp, scores365Resp, betanoOddsResp, supplementalEnrichments, primarySofaEnrichment] = await Promise.all([
     shouldUseOdds
       ? safeFetch('odds', () => is365ScoresProvider
         ? fetch365Odds(eventId)
@@ -1813,11 +1833,20 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
       : Promise.resolve(null),
     useLLM && !is365ScoresProvider && !isAiScoreProvider && !isOgolProvider ? fetchTopPlayersForEvent(event) : Promise.resolve(null),
     useLLM && includeEnrichment && !is365ScoresProvider ? safeFetch('365Scores enrichment', () => fetch365Enrichment(event)) : Promise.resolve(null),
+    shouldUseOdds && betanoOddsEnabled()
+      ? safeFetch('Betano odds', () => fetchBetanoOddsForMatch(event))
+      : Promise.resolve(null),
+    needsDeepData && includeEnrichment
+      ? collectSupplementalEnrichment(event)
+      : Promise.resolve([]),
+    needsDeepData && includeEnrichment && effectiveProvider === 'sofascore'
+      ? fetchSofaScoreEnrichmentByProviderEvent(event)
+      : Promise.resolve(null),
   ]);
   let llmError: string | undefined;
 
   if (useLLM) {
-    const fullInput = buildLLMInput(
+    const baseInput = buildLLMInput(
       { raw: eventResp.raw, data: eventResp.data },
       shouldUseOdds ? oddsResp : null,
       statisticsResp,
@@ -1827,6 +1856,26 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
       topPlayersResp,
       scores365Resp
     );
+    const normalized365 = scores365Resp ? normalize365Enrichment(scores365Resp, event) : null;
+    const allEnrichments = [
+      ...(primarySofaEnrichment ? [primarySofaEnrichment] : []),
+      ...(supplementalEnrichments || []),
+      ...(normalized365 ? [normalized365] : []),
+    ];
+    const fullInput = mergeEnrichmentIntoAnalysisInput(baseInput, allEnrichments);
+    console.info('[AnalysisDataSources]', JSON.stringify({
+      eventId: event.id ?? eventId,
+      primary: effectiveProvider,
+      configuredPrimary: process.env.SCORES_PROVIDER || 'sofascore',
+      ogol: Boolean((supplementalEnrichments || []).find((item) => item.provider === 'ogol')?.available || effectiveProvider === 'ogol'),
+      scores365: Boolean(scores365Resp?.available || effectiveProvider === '365scores'),
+      sofascore: Boolean((supplementalEnrichments || []).find((item) => item.provider === 'sofascore')?.available || effectiveProvider === 'sofascore'),
+      datasets: allEnrichments.map((item) => ({
+        provider: item.provider,
+        available: item.available,
+        provenance: Object.fromEntries(Object.entries(item.provenance || {}).map(([key, value]) => [key, value.status])),
+      })),
+    }));
     const statisticalDecision = buildStatisticalDecision(fullInput, event.id ?? eventId, {
       requireRealOdds,
       minimumExpectedValue,
@@ -1838,6 +1887,16 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
         scores365Resp?.available
           ? scores365Resp.odds
           : { source: '365scores', unavailableReason: scores365Resp?.reason || 'Enriquecimento alternativo nao retornou uma partida correspondente.' },
+        betanoOddsResp || {
+          source: 'betano',
+          bookmaker: 'Betano',
+          unavailableReason: betanoOddsEnabled()
+            ? 'A Betano nao retornou uma partida publica correspondente ou bloqueou a coleta.'
+            : 'Provider Betano desativado por configuracao.',
+        },
+        ...allEnrichments
+          .filter((item) => item.provider !== '365scores' && item.available && item.odds)
+          .map((item) => item.odds),
       ],
     });
     const decisionAudit = statisticalDecision.meta?.decisionAudit as any;

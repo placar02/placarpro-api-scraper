@@ -12,7 +12,7 @@ const recommendation = {
 function odds() {
   return {
     source: 'provider-a',
-    scraped_at: '2026-07-16T10:00:00.000Z',
+    scraped_at: new Date().toISOString(),
     markets_by_group: {
       goals: {
         markets: [{
@@ -55,6 +55,14 @@ describe('validacao de odds reais', () => {
     const enriched = enrichRecommendationWithValidatedOdds(recommendation, odds());
     expect(enriched.meta?.marketOverround).toBeCloseTo(1.0526, 4);
     expect(enriched.meta?.fairImpliedProbability).toBe(50);
+  });
+
+  it('descarta odd expirada antes do calculo de EV', () => {
+    const payload = odds();
+    payload.scraped_at = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+    const enriched = enrichRecommendationWithValidatedOdds(recommendation, payload);
+    expect(enriched.meta?.oddsValidation).toMatchObject({ status: 'waiting_odds' });
+    expect((enriched.meta?.oddsAudit as any).oddsDiscarded[0].reason).toContain('odd expirada');
   });
 
   it('marca como aguardando odds quando nao existe mercado correspondente', () => {

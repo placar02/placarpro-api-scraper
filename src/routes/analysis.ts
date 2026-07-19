@@ -411,8 +411,9 @@ function incidentsHaveCards(incidents: any) {
 }
 
 async function inspectMatchData(eventId: string, event?: any): Promise<MatchDataProfile> {
-  const isAiScoreProvider = process.env.SCORES_PROVIDER === 'aiscore';
-  const isOgolProvider = process.env.SCORES_PROVIDER === 'ogol';
+  const effectiveProvider = event?.sourceProvider || process.env.SCORES_PROVIDER || 'sofascore';
+  const isAiScoreProvider = effectiveProvider === 'aiscore';
+  const isOgolProvider = effectiveProvider === 'ogol';
   const [statistics, lineups, streaks, incidents] = await Promise.all([
     safeLoad(() => isAiScoreProvider ? fetchAiScoreStatistics(eventId) : isOgolProvider ? fetchOgolStatistics(eventId) : fetchStatistics(eventId)),
     safeLoad(() => isAiScoreProvider ? fetchAiScoreLineups(eventId) : isOgolProvider ? fetchOgolLineups(eventId) : fetchLineups(eventId)),
@@ -483,7 +484,7 @@ async function inspectMatchData(eventId: string, event?: any): Promise<MatchData
     hasCornersData,
     missing,
     dataSources: [
-      process.env.SCORES_PROVIDER || 'sofascore',
+      effectiveProvider,
       scores365?.available ? '365scores' : null,
     ].filter(Boolean) as string[],
     scores365Attempted: Boolean(needs365Scores),
@@ -510,7 +511,7 @@ async function inspectMatchData(eventId: string, event?: any): Promise<MatchData
 }
 
 function inspectMatchDataCached(eventId: string, event?: any): Promise<MatchDataProfile> {
-  const key = `${process.env.SCORES_PROVIDER || 'sofascore'}:${eventId}`;
+  const key = `${event?.sourceProvider || process.env.SCORES_PROVIDER || 'sofascore'}:${eventId}`;
   const cached = profileCache.get(key);
   if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.value);
   if (cached) profileCache.delete(key);

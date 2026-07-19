@@ -3,8 +3,31 @@ import { fetchOdds } from '../scrapers/odds';
 import { fetchAiScoreOdds } from '../scrapers/aiscore';
 import { fetch365Odds } from '../scrapers/scores365';
 import { fetchOgolOdds } from '../scrapers/ogol';
+import { betanoOddsEnabled, fetchBetanoOddsForMatch } from '../scrapers/betano-odds';
 
 export const oddsRouter = Router();
+
+oddsRouter.get('/real-odds/betano', async (req, res) => {
+  if (!betanoOddsEnabled()) {
+    return res.status(503).json({ status: 503, source: 'betano', error: 'Provider Betano desativado.' });
+  }
+  const home = String(req.query.home || '').trim();
+  const away = String(req.query.away || '').trim();
+  const startTimestamp = Number(req.query.startTimestamp);
+  if (!home || !away) return res.status(400).json({ error: 'home e away sao obrigatorios.' });
+  try {
+    const data = await fetchBetanoOddsForMatch({
+      homeTeam: { name: home },
+      awayTeam: { name: away },
+      startTimestamp: Number.isFinite(startTimestamp) ? startTimestamp : undefined,
+    });
+    if (!data) return res.status(404).json({ status: 404, source: 'betano', error: 'Partida ou odds nao encontradas.' });
+    return res.json({ status: 200, source: 'betano', data });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return res.status(503).json({ status: 503, source: 'betano', error: message });
+  }
+});
 
 /**
  * @swagger

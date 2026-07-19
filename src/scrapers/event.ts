@@ -3,6 +3,7 @@ import { fetchAiScoreEvent } from './aiscore';
 import { fetch365Event } from './scores365';
 import { fetchOgolEvent } from './ogol';
 import type { EventApiResponse, NormalizedEvent } from '../types/event';
+import { resolveEventSource } from '../providers/event-source-registry';
 
 const SOFASCORE_BASE_URL = process.env.SOFASCORE_BASE_URL || 'https://www.sofascore.com/api/v1';
 const SOFASCORE_FALLBACK_BASE_URLS = [
@@ -32,6 +33,7 @@ const BROWSER_HEADERS = {
 
 interface FetchEventOptions {
   retryOn403?: boolean;
+  provider?: 'sofascore' | 'ogol' | '365scores' | 'aiscore';
 }
 
 interface EventResponse {
@@ -192,14 +194,21 @@ export async function fetchEvent(
   eventId: number | string,
   options: FetchEventOptions = {}
 ): Promise<EventResponse> {
-  if (process.env.SCORES_PROVIDER === '365scores') {
-    return fetch365Event(eventId) as Promise<EventResponse>;
+  const provider = options.provider || resolveEventSource(eventId) || process.env.SCORES_PROVIDER || 'sofascore';
+  if (provider === '365scores') {
+    const response = await fetch365Event(eventId) as EventResponse;
+    if (response.data) response.data.sourceProvider = '365scores';
+    return response;
   }
-  if (process.env.SCORES_PROVIDER === 'ogol') {
-    return fetchOgolEvent(eventId) as Promise<EventResponse>;
+  if (provider === 'ogol') {
+    const response = await fetchOgolEvent(eventId) as EventResponse;
+    if (response.data) response.data.sourceProvider = 'ogol';
+    return response;
   }
-  if (process.env.SCORES_PROVIDER === 'aiscore') {
-    return fetchAiScoreEvent(eventId) as Promise<EventResponse>;
+  if (provider === 'aiscore') {
+    const response = await fetchAiScoreEvent(eventId) as EventResponse;
+    if (response.data) response.data.sourceProvider = 'aiscore';
+    return response;
   }
 
   const { retryOn403 = true } = options;
@@ -241,6 +250,7 @@ export async function fetchEvent(
     // Normalize the API response with safe access to optional fields
     const normalizedData: NormalizedEvent = {
       id: event.id,
+      sourceProvider: 'sofascore',
       slug: event.slug || '',
       status: {
         code: event.status?.code ?? 0,
