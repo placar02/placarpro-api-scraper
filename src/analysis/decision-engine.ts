@@ -1,6 +1,14 @@
 import type { AnalysisResult, BettingRecommendation } from '../types/analysis';
 import { getMarketDecisionPolicy, type AnalysisMarketFamily, type MarketDecisionPolicy } from '../config/decisionPolicy';
 import { enrichAnalysisWithValidatedOdds } from './odds-validation';
+import { evaluateDataQuality } from './data-quality-engine';
+import { buildFeatureProfile } from './feature-engine';
+import { assessMarketWithEngine } from './market-engines';
+import { resolveAnalysisWeights, weightedScore } from './weight-engine';
+import { rankAnalysisCandidates } from './meta-analysis-engine';
+import { buildConfidenceBreakdown } from './confidence-breakdown';
+import { calculateMatchScore } from './match-score-engine';
+import { observeAnalysis } from '../observability/analysis-observer';
 
 export const NO_RECOMMENDATION = 'Nenhuma entrada recomendada para este jogo.';
 export const OPTIONAL_DATA_UNAVAILABLE = 'Dado não disponível.';
@@ -28,6 +36,8 @@ export type DecisionCandidateAudit = {
   fairImpliedProbability?: number;
   oddsStatus?: string;
   oddsAudit?: unknown;
+  engine?: string;
+  metaScore?: number;
   policy: MarketDecisionPolicy;
 };
 
@@ -41,6 +51,9 @@ export type DecisionAudit = {
   selectedRecommendation?: string;
   reasons: string[];
   requireRealOdds?: boolean;
+  dataQualityReport?: unknown;
+  features?: unknown;
+  metaAnalysis?: unknown;
 };
 
 function normalized(value: unknown) {
@@ -79,16 +92,6 @@ function clamp(value: number, min = 0, max = 100) {
   return Math.min(max, Math.max(min, Math.round(value)));
 }
 
-function familyOf(recommendation: BettingRecommendation): MarketFamily {
-  const text = normalized(`${recommendation.market} ${recommendation.recommendation}`);
-  if (/escanteio|corner/.test(text)) return 'corners';
-  if (/cart|amarelo|vermelho|falta/.test(text)) return 'cards';
-  if (/chute|finaliza|remate|jogador|gol de|assistencia/.test(text)) return 'player';
-  if (/over|under|gol|ambas|btts|mais de|menos de/.test(text)) return 'goals';
-  if (/vencedor|resultado|handicap|dupla chance|empate anula|draw no bet|1x2|match.winner/.test(text)) return 'winner';
-  return 'unknown';
-}
-
 function allStatItems(input: any) {
   return (input?.statistics?.teamPeriods || [])
     .flatMap((period: any) => period?.groups || [])
@@ -99,17 +102,9 @@ function matchingStats(input: any, pattern: RegExp) {
   return allStatItems(input).filter((item: any) => pattern.test(normalized(`${item?.name} ${item?.key}`)));
 }
 
+// Kept for the legacy candidate generator below; validation itself runs in market-engines/.
 function hasNumericPair(items: any[]) {
   return items.some((item) => finite(item?.home) !== undefined && finite(item?.away) !== undefined);
-}
-
-function historyPlayed(input: any, side: 'home' | 'away') {
-  const recent = input?.teamForm?.[`${side}Recent`];
-  return finite(recent?.played) || 0;
-}
-
-function seasonPlayed(input: any, side: 'home' | 'away') {
-  return finite(input?.statistics?.context?.seasonFacts?.[side]?.matches) || 0;
 }
 
 function rate(input: any, side: 'home' | 'away', field: string) {
@@ -119,66 +114,6 @@ function rate(input: any, side: 'home' | 'away', field: string) {
 function average(values: Array<number | undefined>) {
   const present = values.filter((value): value is number => value !== undefined);
   return present.length ? present.reduce((total, value) => total + value, 0) / present.length : undefined;
-}
-
-function dataQuality(input: any) {
-  const homeMatches = historyPlayed(input, 'home');
-  const awayMatches = historyPlayed(input, 'away');
-  const statItems = allStatItems(input);
-  const homePlayers = input?.lineups?.home?.starters?.length || input?.lineups?.home?.keyPlayersByMarketValue?.length || 0;
-  const awayPlayers = input?.lineups?.away?.starters?.length || input?.lineups?.away?.keyPlayersByMarketValue?.length || 0;
-  const h2h = input?.teamForm?.headToHead?.played || input?.streaks?.head2head?.length || 0;
-  const homeSeasonMatches = seasonPlayed(input, 'home');
-  const awaySeasonMatches = seasonPlayed(input, 'away');
-  const missing: string[] = [];
-  let score = 0;
-
-  if (homeMatches >= 10 && awayMatches >= 10) score += 30;
-  else if (homeMatches >= 5 && awayMatches >= 5) score += 27;
-  else if (homeMatches >= 3 && awayMatches >= 3) score += 22;
-  else if (homeMatches >= 2 && awayMatches >= 2) score += 12;
-  else missing.push('historico_recente_insuficiente');
-
-  if (statItems.length >= 10) score += 30;
-  else if (statItems.length >= 6) score += 25;
-  else if (statItems.length >= 3) score += 18;
-  else if (statItems.length > 0) score += 8;
-  else missing.push('estatisticas_de_equipe');
-
-  if (homeSeasonMatches >= 5 && awaySeasonMatches >= 5) score += 15;
-  else missing.push('amostra_da_temporada');
-
-  const hasVenueSplits = Boolean(
-    input?.teamForm?.homeRecent?.homePerformance?.played
-    && input?.teamForm?.awayRecent?.awayPerformance?.played
-  );
-  if (hasVenueSplits) score += 8;
-  else missing.push('desempenho_casa_fora');
-
-  if (homePlayers >= 5 && awayPlayers >= 5) score += 6;
-  else missing.push('escalacoes_ou_elenco');
-
-  if (h2h >= 3) score += 5;
-  else missing.push('confrontos_diretos');
-
-  if (input?.event?.referee?.id || input?.refereeProfile?.id || input?.statistics?.context?.referee?.name) score += 3;
-  else missing.push('arbitro');
-
-  if (input?.statistics?.context?.competitionTable?.home || input?.statistics?.context?.teamNeeds?.home) score += 3;
-  else missing.push('contexto_do_campeonato');
-
-  const sourceConsensusBonus = Math.min(3, Math.max(0, finite(input?.dataQuality?.sourceConsensus?.confidenceBonus) || 0));
-  return {
-    score: clamp(score + sourceConsensusBonus),
-    baseScore: clamp(score),
-    sourceConsensusBonus,
-    missing,
-    homeMatches,
-    awayMatches,
-    homeSeasonMatches,
-    awaySeasonMatches,
-    statItems,
-  };
 }
 
 function assessGoals(input: any, recommendation: BettingRecommendation) {
@@ -289,7 +224,17 @@ function decimalOdd(recommendation: BettingRecommendation) {
 }
 
 export function applySelectiveDecisionGate(result: AnalysisResult, input: any, options: DecisionGateOptions = {}): AnalysisResult {
-  const quality = dataQuality(input);
+  const quality = evaluateDataQuality({
+    ...input,
+    oddsResponses: options.oddsResponses,
+    dataQuality: {
+      ...(input?.dataQuality || {}),
+      oddsAvailable: Boolean(options.oddsResponses || input?.odds || input?.oddsResponses),
+    },
+  });
+  const features = buildFeatureProfile(input);
+  observeAnalysis('data_quality', result.eventId, { score: quality.score, dimensions: quality.dimensions, missing: quality.missing });
+  observeAnalysis('features', result.eventId, { indices: features.indices });
   const sourceRecommendations = result.recommendations?.length
     ? result.recommendations
     : result.bestEntry
@@ -306,13 +251,17 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any, o
     recommendation,
   ])).values()];
 
-  const candidates = uniqueRecommendations.map((recommendation) => {
-    const market = assessMarket(input, recommendation);
+  const assessedCandidates = uniqueRecommendations.map((recommendation) => {
+    const market = assessMarketWithEngine(features, recommendation);
     const policy = getMarketDecisionPolicy(market.family, options.minimumExpectedValue);
     const aiConfidence = clamp(finite(recommendation.confidence) ?? 0);
     // Source confidence is kept only for audit. The published probability is
     // derived exclusively from measured data quality and market evidence.
-    const rawModelConfidence = (quality.score * 0.45) + (market.score * 0.55);
+    const weights = resolveAnalysisWeights({ competition: result.tournamentName || input?.event?.tournament?.name, market: market.family });
+    const rawModelConfidence = weightedScore(
+      { dataQuality: quality.score, marketEvidence: market.score },
+      weights.confidence,
+    );
     const configuredShrinkage = Number(process.env.ANALYSIS_UNCALIBRATED_SHRINKAGE ?? 0.8);
     const shrinkage = Number.isFinite(configuredShrinkage) ? Math.min(0.95, Math.max(0.5, configuredShrinkage)) : 0.8;
     let objectiveConfidence = clamp(50 + ((rawModelConfidence - 50) * shrinkage));
@@ -375,10 +324,27 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any, o
       fairImpliedProbability,
       oddsStatus: oddsValidationStatus || 'not_checked',
       oddsAudit: recommendation.meta?.oddsAudit,
+      engine: market.engine,
       policy,
       original: recommendation,
     };
-  }).sort((a, b) => b.objectiveConfidence - a.objectiveConfidence || b.marketEvidence - a.marketEvidence);
+  });
+  const candidates = rankAnalysisCandidates(assessedCandidates, {
+    competition: result.tournamentName || input?.event?.tournament?.name,
+    consensus: 50 + quality.sourceConsensusBonus * 15,
+    missingCount: quality.missing.length,
+  });
+  observeAnalysis('market_decision', result.eventId, {
+    candidates: candidates.map(({ original: _original, oddsAudit: _oddsAudit, ...candidate }) => candidate),
+  });
+  observeAnalysis('odds_ev', result.eventId, {
+    candidates: candidates.map((candidate) => ({
+      market: candidate.market,
+      oddsStatus: candidate.oddsStatus,
+      expectedValue: candidate.expectedValue,
+      probabilityEdge: candidate.probabilityEdge,
+    })),
+  });
 
   const selected = candidates.find((candidate) => candidate.objectiveConfidence >= candidate.policy.minConfidence && candidate.rejectionReasons.length === 0);
   const waiting = !selected ? candidates.find((candidate) => (
@@ -388,6 +354,7 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any, o
   )) : undefined;
   const chosen = selected || waiting;
   const threshold = chosen?.policy.minConfidence || candidates[0]?.policy.minConfidence || 80;
+  const { statItems: _statItems, ...qualityAudit } = quality;
   const audit: DecisionAudit = {
     decision: selected ? 'approved' : waiting ? 'waiting_odds' : 'rejected',
     threshold,
@@ -402,11 +369,22 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any, o
         ? ['odd real correspondente ao mercado nao encontrada; analise preservada aguardando nova coleta']
       : [...new Set(candidates.flatMap((candidate) => candidate.rejectionReasons))],
     requireRealOdds: Boolean(options.requireRealOdds),
+    dataQualityReport: qualityAudit,
+    features: features.indices,
+    metaAnalysis: {
+      selectedScore: chosen?.metaScore,
+      ranking: candidates.map((candidate) => ({
+        market: candidate.market,
+        recommendation: candidate.recommendation,
+        score: candidate.metaScore,
+      })),
+    },
   };
 
-  console.info('[AnalysisDecision]', JSON.stringify({ eventId: result.eventId, ...audit }));
+  observeAnalysis('meta_analysis', result.eventId, { decision: audit.decision, selectedMarket: audit.selectedMarket, metaAnalysis: audit.metaAnalysis });
 
   if (!selected && !waiting) {
+    observeAnalysis('publication', result.eventId, { status: 'rejected', reasons: audit.reasons });
     return {
       ...result,
       market: 'none',
@@ -418,11 +396,32 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any, o
       bestEntry: undefined,
       recommendations: [],
       analysisStatus: 'rejected',
-      meta: { ...(result.meta || {}), decisionAudit: audit },
+      meta: {
+        ...(result.meta || {}),
+        decisionAudit: audit,
+        dataQualityScore: quality.score,
+        featureProfile: features.indices,
+        matchScore: calculateMatchScore({ quality, features, confidence: 0, competition: result.tournamentName }),
+      },
     };
   }
 
   const effectiveSelection = selected || waiting!;
+  const confidenceBreakdown = buildConfidenceBreakdown({
+    finalConfidence: effectiveSelection.objectiveConfidence,
+    quality,
+    features,
+    marketEvidence: effectiveSelection.marketEvidence,
+    expectedValue: effectiveSelection.expectedValue,
+    oddsMatched: effectiveSelection.oddsStatus === 'matched',
+  });
+  const matchScore = calculateMatchScore({
+    quality,
+    features,
+    confidence: effectiveSelection.objectiveConfidence,
+    expectedValue: effectiveSelection.expectedValue,
+    competition: result.tournamentName || input?.event?.tournament?.name,
+  });
   const approvedRecommendation: BettingRecommendation = {
     ...effectiveSelection.original,
     confidence: effectiveSelection.objectiveConfidence,
@@ -436,8 +435,19 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any, o
       probabilityEdge: effectiveSelection.probabilityEdge,
       fairImpliedProbability: effectiveSelection.fairImpliedProbability,
       decisionPolicy: effectiveSelection.policy,
+      matchScore,
+      confidenceBreakdown,
+      metaAnalysisScore: effectiveSelection.metaScore,
     },
   };
+
+  observeAnalysis('publication', result.eventId, {
+    status: waiting ? 'waiting_odds' : 'approved',
+    market: approvedRecommendation.market,
+    recommendation: approvedRecommendation.recommendation,
+    confidence: approvedRecommendation.confidence,
+    matchScore,
+  });
 
   return {
     ...result,
@@ -448,7 +458,14 @@ export function applySelectiveDecisionGate(result: AnalysisResult, input: any, o
     bestEntry: approvedRecommendation,
     recommendations: [approvedRecommendation],
     analysisStatus: waiting ? 'waiting_odds' : 'approved',
-    meta: { ...(result.meta || {}), decisionAudit: audit },
+    meta: {
+      ...(result.meta || {}),
+      decisionAudit: audit,
+      dataQualityScore: quality.score,
+      featureProfile: features.indices,
+      matchScore,
+      confidenceBreakdown,
+    },
   };
 }
 
