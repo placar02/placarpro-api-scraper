@@ -156,7 +156,8 @@ function quickEventResult(event: any, cached?: AnalysisResult | null): AnalysisR
     goalsConceded: { home: awayGoals, away: homeGoals },
     homeAdvantage: event?.homeTeam?.name || cached?.homeTeam?.name,
     recentMatches: cached?.meta?.recentMatches || [],
-    analysisStatus: cached ? 'cached' : 'processing',
+    analysisStatus: cached?.analysisStatus,
+    processingStatus: cached ? 'cached' : 'processing',
     analysisSource: cached?.analysisSource,
     meta: { ...(cached?.meta || {}), mode: 'fast', cacheHit: Boolean(cached) },
   };
@@ -186,6 +187,10 @@ function shouldWait(req: express.Request) {
 
 function sendJob(res: express.Response, key: string, quickResult: unknown, task: () => Promise<unknown>) {
   const job = enqueueAnalysisJob(key, quickResult, task);
+  if (!job) {
+    res.status(503).json({ ok: false, error: 'Fila de analises temporariamente cheia.', code: 'ANALYSIS_QUEUE_FULL' });
+    return;
+  }
   res.status(202).json(analysisJobPayload(job));
 }
 
@@ -414,12 +419,13 @@ async function inspectMatchData(eventId: string, event?: any): Promise<MatchData
   const effectiveProvider = event?.sourceProvider || process.env.SCORES_PROVIDER || 'sofascore';
   const isAiScoreProvider = effectiveProvider === 'aiscore';
   const isOgolProvider = effectiveProvider === 'ogol';
-  const [statistics, lineups, streaks, incidents] = await Promise.all([
-    safeLoad(() => isAiScoreProvider ? fetchAiScoreStatistics(eventId) : isOgolProvider ? fetchOgolStatistics(eventId) : fetchStatistics(eventId)),
-    safeLoad(() => isAiScoreProvider ? fetchAiScoreLineups(eventId) : isOgolProvider ? fetchOgolLineups(eventId) : fetchLineups(eventId)),
-    safeLoad(() => isAiScoreProvider ? fetchAiScoreStreaks(eventId) : isOgolProvider ? fetchOgolStreaks(eventId) : fetchStreaks(eventId)),
-    safeLoad(() => isAiScoreProvider ? fetchAiScoreIncidents(eventId) : isOgolProvider ? fetchOgolIncidents(eventId) : fetchIncidents(eventId)),
-  ]);
+  const providerTasks: Array<Promise<any>> = [
+    safeLoad<any>(() => isAiScoreProvider ? fetchAiScoreStatistics(eventId) : isOgolProvider ? fetchOgolStatistics(eventId) : fetchStatistics(eventId)),
+    safeLoad<any>(() => isAiScoreProvider ? fetchAiScoreLineups(eventId) : isOgolProvider ? fetchOgolLineups(eventId) : fetchLineups(eventId)),
+    safeLoad<any>(() => isAiScoreProvider ? fetchAiScoreStreaks(eventId) : isOgolProvider ? fetchOgolStreaks(eventId) : fetchStreaks(eventId)),
+    safeLoad<any>(() => isAiScoreProvider ? fetchAiScoreIncidents(eventId) : isOgolProvider ? fetchOgolIncidents(eventId) : fetchIncidents(eventId)),
+  ];
+  const [statistics, lineups, streaks, incidents] = await Promise.all(providerTasks);
   const needs365Scores = isAiScoreProvider && event && (
     countStatisticsItems(statistics) === 0
     || countLineupPlayers(lineups) < 10
@@ -1202,15 +1208,15 @@ async function resolveAnalysisEventByTeams(req: express.Request) {
       ? matchesResponse.data
       : [];
 
-  const ranked = events
-    .map((event) => ({
+  const ranked = (events as any[])
+    .map((event: any) => ({
       event,
       score: scoreEventNameMatch(event, params),
     }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score || getEventTimestamp(a.event) - getEventTimestamp(b.event));
+    .filter((item: { score: number }) => item.score > 0)
+    .sort((a: { score: number; event: any }, b: { score: number; event: any }) => b.score - a.score || getEventTimestamp(a.event) - getEventTimestamp(b.event));
   const best = ranked[0];
-  const candidates = ranked.slice(0, 8).map((item) => ({
+  const candidates = ranked.slice(0, 8).map((item: { score: number; event: any }) => ({
     id: item.event.id,
     homeTeam: teamName(item.event, 'home'),
     awayTeam: teamName(item.event, 'away'),
@@ -1598,7 +1604,7 @@ analysisRouter.get('/analysis', async (req, res) => {
   try {
     const resolved = await resolveAnalysisEventByTeams(req);
     if ('error' in resolved) {
-      res.status(resolved.status).json({ ok: false, ...resolved });
+      res.status(resolved.status || 500).json({ ok: false, ...resolved });
       return;
     }
 
@@ -1678,7 +1684,7 @@ analysisRouter.get('/analysis/by-teams', async (req, res) => {
 
     const resolved = await resolveAnalysisEventByTeams(req);
     if ('error' in resolved) {
-      res.status(resolved.status).json({ ok: false, ...resolved });
+      res.status(resolved.status || 500).json({ ok: false, ...resolved });
       return;
     }
     const cached = getCachedAnalysis(resolved.eventId, options);

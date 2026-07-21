@@ -201,7 +201,7 @@ export async function fetchEvent(
     return response;
   }
   if (provider === 'ogol') {
-    const response = await fetchOgolEvent(eventId) as EventResponse;
+    const response = await fetchOgolEvent(eventId) as unknown as EventResponse;
     if (response.data) response.data.sourceProvider = 'ogol';
     return response;
   }

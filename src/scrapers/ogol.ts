@@ -1241,7 +1241,7 @@ async function loadOgolDetails(eventId: number | string): Promise<OgolEventDetai
           referee: {
             ...refereeContext,
             ...profile,
-            note: Object.keys(profile).some((key) => ['games', 'yellowCards', 'redCards', 'cardsAverage'].includes(key) && profile[key] !== undefined)
+            note: Object.keys(profile).some((key) => ['games', 'yellowCards', 'redCards', 'cardsAverage'].includes(key) && (profile as Record<string, unknown>)[key] !== undefined)
               ? 'Perfil público do árbitro consultado no OGOL.'
               : refereeContext?.note,
           },
@@ -1372,7 +1372,7 @@ export function deepStatisticItems(richData: any) {
           return;
         }
         const pair = valueText.match(/-?\d+(?:[.,]\d+)?%?/g) || [];
-        if (pair.length >= 2) candidates.push({ label: columnLabel, home: pair[0], away: pair[1] });
+        if (pair.length >= 2) candidates.push({ label: columnLabel, home: pair[0]!, away: pair[1]! });
       });
     }
   }

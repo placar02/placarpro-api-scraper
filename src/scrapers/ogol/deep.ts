@@ -24,9 +24,9 @@ type PageRecord = {
 type HistoricalMatch = {
   id: number;
   url: string;
-  date?: string;
-  homeSlug?: string;
-  awaySlug?: string;
+  date: string;
+  homeSlug: string;
+  awaySlug: string;
   homeScore: number;
   awayScore: number;
   context: string;
@@ -490,7 +490,7 @@ export function fetchOgolDeepData(eventId: number | string, matchUrl: string, ho
     const disk = await readDeepDiskCache(key);
     if (disk) return disk;
     const staleDisk = await readDeepDiskCache(key, true);
-    const result = await withDeepCollectionSlot(() => collectDeepData(key, matchUrl, homeTeam, awayTeam));
+    const result: any = await withDeepCollectionSlot(() => collectDeepData(key, matchUrl, homeTeam, awayTeam));
     const stalePages = Number(staleDisk?.coverage?.pagesCollected || 0);
     const collectedPages = Number(result?.coverage?.pagesCollected || 0);
     if (staleDisk?.available && stalePages > collectedPages) {

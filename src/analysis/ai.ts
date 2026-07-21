@@ -48,6 +48,22 @@ let activeAzureRequests = 0;
 const azureWaiters: Array<() => void> = [];
 let azureRateLimitedUntil = 0;
 let azureRateLimitReason = '';
+let azureConsecutiveFailures = 0;
+
+function registerAzureFailure(reason: string) {
+  azureConsecutiveFailures += 1;
+  const threshold = Math.max(2, Number(process.env.AZURE_OPENAI_CIRCUIT_FAILURES || 3));
+  if (azureConsecutiveFailures < threshold) return;
+  const cooldownMs = Math.max(30_000, Number(process.env.AZURE_OPENAI_COOLDOWN_MS || 5 * 60 * 1000));
+  azureRateLimitedUntil = Date.now() + cooldownMs;
+  azureRateLimitReason = reason;
+}
+
+function resetAzureFailures() {
+  azureConsecutiveFailures = 0;
+  azureRateLimitedUntil = 0;
+  azureRateLimitReason = '';
+}
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1144,11 +1160,20 @@ async function callLLMAnalysis(input: LLMAnalysisInput): Promise<LLMAnalysisResp
   const promise = withAzureSlot(() => performLLMAnalysis(input))
     .then((response) => {
       if (response.result) {
+        resetAzureFailures();
         const ttlMs = Math.max(1000, Number(process.env.AZURE_OPENAI_CACHE_TTL_MS || 15 * 60 * 1000));
         azureResponseCache.set(key, { expiresAt: Date.now() + ttlMs, value: response });
         pruneAzureCache();
       }
+      if (response.error && /429|5\d\d|timeout|abort|network|fetch/i.test(response.error)) {
+        registerAzureFailure(response.error);
+      }
       return response;
+    })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      registerAzureFailure(message);
+      return { result: null, error: `Azure OpenAI indisponivel: ${message}` };
     })
     .finally(() => azureInFlight.delete(key));
   azureInFlight.set(key, promise);
@@ -1451,8 +1476,7 @@ Responda somente JSON valido com: matchAnalysis, keyFactors, marketBreakdown, ri
       return { result: null, error: `Azure OpenAI error ${res.status}: ${errorText}` };
     }
 
-    azureRateLimitedUntil = 0;
-    azureRateLimitReason = '';
+    resetAzureFailures();
 
     const json = await res.json();
     const rawContent = json?.choices?.[0]?.message?.content;
@@ -1811,7 +1835,7 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
   const needsDeepData = useLLM;
   const [oddsResp, statisticsResp, incidentsResp, lineupsResp, streaksResp, topPlayersResp, scores365Resp, betanoOddsResp, supplementalEnrichments, primarySofaEnrichment] = await Promise.all([
     shouldUseOdds
-      ? safeFetch('odds', () => is365ScoresProvider
+      ? safeFetch<any>('odds', () => is365ScoresProvider
         ? fetch365Odds(eventId)
         : isAiScoreProvider
           ? fetchAiScoreOdds(eventId)
@@ -1820,16 +1844,16 @@ export async function analyzeEvent(eventId: number | string, options: AnalyzeOpt
             : fetchOdds(eventId, 1))
       : Promise.resolve(null),
     needsDeepData && !is365ScoresProvider
-      ? safeFetch('statistics', () => isAiScoreProvider ? fetchAiScoreStatistics(eventId) : isOgolProvider ? fetchOgolStatistics(eventId) : fetchStatistics(eventId))
+      ? safeFetch<any>('statistics', () => isAiScoreProvider ? fetchAiScoreStatistics(eventId) : isOgolProvider ? fetchOgolStatistics(eventId) : fetchStatistics(eventId))
       : Promise.resolve(null),
     needsDeepData && !is365ScoresProvider
-      ? safeFetch('incidents', () => isAiScoreProvider ? fetchAiScoreIncidents(eventId) : isOgolProvider ? fetchOgolIncidents(eventId) : fetchIncidents(eventId))
+      ? safeFetch<any>('incidents', () => isAiScoreProvider ? fetchAiScoreIncidents(eventId) : isOgolProvider ? fetchOgolIncidents(eventId) : fetchIncidents(eventId))
       : Promise.resolve(null),
     needsDeepData && !is365ScoresProvider
-      ? safeFetch('lineups', () => isAiScoreProvider ? fetchAiScoreLineups(eventId) : isOgolProvider ? fetchOgolLineups(eventId) : fetchLineups(eventId))
+      ? safeFetch<any>('lineups', () => isAiScoreProvider ? fetchAiScoreLineups(eventId) : isOgolProvider ? fetchOgolLineups(eventId) : fetchLineups(eventId))
       : Promise.resolve(null),
     needsDeepData && !is365ScoresProvider
-      ? safeFetch('streaks', () => isAiScoreProvider ? fetchAiScoreStreaks(String(eventId)) : isOgolProvider ? fetchOgolStreaks(String(eventId)) : fetchStreaks(String(eventId)))
+      ? safeFetch<any>('streaks', () => isAiScoreProvider ? fetchAiScoreStreaks(String(eventId)) : isOgolProvider ? fetchOgolStreaks(String(eventId)) : fetchStreaks(String(eventId)))
       : Promise.resolve(null),
     useLLM && !is365ScoresProvider && !isAiScoreProvider && !isOgolProvider ? fetchTopPlayersForEvent(event) : Promise.resolve(null),
     useLLM && includeEnrichment && !is365ScoresProvider ? safeFetch('365Scores enrichment', () => fetch365Enrichment(event)) : Promise.resolve(null),

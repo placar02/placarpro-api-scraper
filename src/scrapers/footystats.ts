@@ -232,7 +232,7 @@ function pickTeam(data: any, teamId: unknown, teamName: string) {
   return teams.find((team: any) => String(team.id) === String(teamId))
     || teams
       .map((team: any) => ({ team, score: nameScore(teamName, team.name || team.full_name || team.english_name) }))
-      .sort((a, b) => b.score - a.score)[0]?.team;
+      .sort((a: { score: number }, b: { score: number }) => b.score - a.score)[0]?.team;
 }
 
 function pickReferee(data: any, refereeId: unknown) {

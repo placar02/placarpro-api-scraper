@@ -10,7 +10,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
-    "express": "^5.1.0",
+    "express": "^5.2.1",
     "playwright": "^1.56.0",
     "protobufjs": "^8.6.4",
     "swagger-jsdoc": "^6.2.8",
@@ -20,11 +20,13 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/index.ts",
-    "build": "tsx -e \"import('./src/server.ts').then(() => console.log('Scraper modules loaded successfully'))\"",
+    "build": "npm run typecheck",
     "postinstall": "playwright install chromium",
     "dev": "nodemon --exec tsx src/index.ts",
     "test": "vitest run",
-    "test:routes": "vitest run tests/routes.chain.test.ts --reporter=verbose"
+    "test:routes": "vitest run tests/routes.chain.test.ts --reporter=verbose",
+    "test:routes:live": "cross-env RUN_LIVE_INTEGRATION_TESTS=true vitest run tests/routes.chain.test.ts --reporter=verbose",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
@@ -33,8 +35,22 @@
     "@types/supertest": "^6.0.3",
     "@types/swagger-jsdoc": "^6.0.3",
     "@types/swagger-ui-express": "^4.1.5",
+    "cross-env": "^7.0.3",
     "nodemon": "^3.1.14",
     "supertest": "^7.1.4",
-    "vitest": "^3.2.4"
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.6"
+  },
+  "overrides": {
+    "body-parser": "^2.2.1",
+    "brace-expansion": "^1.1.13",
+    "esbuild": "^0.28.1",
+    "form-data": "^4.0.6",
+    "js-yaml": "^4.1.2",
+    "minimatch": "^3.1.4",
+    "path-to-regexp": "^8.4.0",
+    "picomatch": "^2.3.2",
+    "qs": "^6.15.2",
+    "vite": "^7.3.5"
   }
 }

@@ -86,11 +86,15 @@ export type TimeInfo = {
   max: number;
   extra: number;
   currentPeriodStartTimestamp: number;
+  current?: number;
 };
 
 export type EventLive = {
   id: number;
   sourceProvider?: 'sofascore' | 'ogol' | '365scores' | 'aiscore';
+  liveMinute?: number;
+  currentTime?: number;
+  providerStatus?: unknown;
   customId: string;
   slug: string;
   startTimestamp: number;

@@ -87,7 +87,7 @@ async function findMatchingSofaScoreEvent(event: NormalizedEvent) {
       .catch(() => fetchScheduledMatches(date, true, false))
       .catch((error) => ({ events: [], error: error instanceof Error ? error.message : String(error) })),
   })));
-  const candidates = responses.flatMap(({ date, response }) => (response.events || []).map((candidate) => ({
+  const candidates = responses.flatMap(({ date, response }) => (response.events || []).map((candidate: any) => ({
     event: candidate,
     score: scoreSofaScoreCandidate(event, candidate),
     date,
@@ -98,10 +98,10 @@ async function findMatchingSofaScoreEvent(event: NormalizedEvent) {
     best: ranked[0],
     scheduleAttempts: responses.map(({ date, response }) => ({
       date,
-      status: response.status,
-      url: response.url,
+      status: (response as any).status,
+      url: (response as any).url,
       events: response.events?.length || 0,
-      attempts: response.attempts,
+      attempts: (response as any).attempts,
       error: (response as any).error,
     })),
     candidates: ranked.map((item) => ({

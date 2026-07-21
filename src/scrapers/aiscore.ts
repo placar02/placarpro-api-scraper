@@ -419,8 +419,8 @@ function normalizeStatsItems(raw: any) {
     .filter((item: any) => item.home.value || item.away.value);
 }
 
-function buildPlayerMap(raw: any) {
-  return new Map((raw?.players || []).map((player: any) => [String(player.id), player]));
+function buildPlayerMap(raw: any): Map<string, any> {
+  return new Map<string, any>((raw?.players || []).map((player: any) => [String(player.id), player]));
 }
 
 function normalizeAiScorePlayer(lineupItem: any, playerMap: Map<string, any>, substitute = false) {

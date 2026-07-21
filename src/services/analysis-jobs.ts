@@ -27,6 +27,8 @@ let activeJobs = 0;
 
 const concurrency = () => Math.max(1, Number(process.env.ANALYSIS_JOB_CONCURRENCY || 1));
 const ttlMs = () => Math.max(60_000, Number(process.env.ANALYSIS_JOB_TTL_MS || 60 * 60 * 1000));
+const maxQueuedJobs = () => Math.max(1, Number(process.env.ANALYSIS_JOB_MAX_QUEUE || 50));
+const maxStoredJobs = () => Math.max(maxQueuedJobs(), Number(process.env.ANALYSIS_JOB_MAX_STORED || 500));
 
 function queuePosition(job: AnalysisJob) {
   if (job.status !== 'queued') return undefined;
@@ -57,6 +59,16 @@ function pruneJobs() {
     if (job.updatedAt >= threshold || ['queued', 'processing'].includes(job.status)) continue;
     jobs.delete(id);
     if (jobsByKey.get(job.key) === id) jobsByKey.delete(job.key);
+  }
+  if (jobs.size > maxStoredJobs()) {
+    const removable = [...jobs.values()]
+      .filter((job) => !['queued', 'processing'].includes(job.status))
+      .sort((left, right) => left.updatedAt - right.updatedAt);
+    while (jobs.size > maxStoredJobs() && removable.length) {
+      const job = removable.shift()!;
+      jobs.delete(job.id);
+      if (jobsByKey.get(job.key) === job.id) jobsByKey.delete(job.key);
+    }
   }
 }
 
@@ -93,6 +105,7 @@ export function enqueueAnalysisJob<T>(key: string, quickResult: unknown, task: (
   const existingId = jobsByKey.get(key);
   const existing = existingId ? jobs.get(existingId) as AnalysisJob<T> | undefined : undefined;
   if (existing && ['queued', 'processing'].includes(existing.status)) return existing;
+  if (queue.length >= maxQueuedJobs()) return null;
 
   const now = Date.now();
   const job: AnalysisJob<T> = {
@@ -109,6 +122,9 @@ export function enqueueAnalysisJob<T>(key: string, quickResult: unknown, task: (
   setImmediate(runQueue);
   return job;
 }
+
+const cleanupTimer = setInterval(pruneJobs, 60_000);
+cleanupTimer.unref?.();
 
 export function getAnalysisJob(id: string) {
   pruneJobs();

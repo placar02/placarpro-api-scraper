@@ -14,7 +14,7 @@ type RuntimeContext = {
   seasonId?: string;
 };
 
-const operationalStatuses = new Set([200, 304, 404]);
+const operationalStatuses = new Set([200, 304]);
 const routeResults: RouteResult[] = [];
 const ctx: RuntimeContext = {};
 
@@ -27,11 +27,13 @@ async function hitRoute(path: string) {
 function expectOperational(route: string, status: number) {
   expect(
     operationalStatuses.has(status),
-    `Rota ${route} retornou status inesperado: ${status}. Esperado: 200, 304 ou 404.`,
+    `Rota ${route} retornou status inesperado: ${status}. Esperado: 200 ou 304.`,
   ).toBe(true);
 }
 
-describe.sequential('Encadeamento de testes das rotas (baseado em live matches)', () => {
+const liveDescribe = process.env.RUN_LIVE_INTEGRATION_TESTS === 'true' ? describe.sequential : describe.skip;
+
+liveDescribe('Encadeamento de testes das rotas (baseado em live matches)', () => {
   beforeAll(async () => {
     const liveResponse = await hitRoute('/live-matches');
     expectOperational('/live-matches', liveResponse.status);

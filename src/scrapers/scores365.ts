@@ -107,7 +107,7 @@ async function fetch365<T>(path: string, extra: Record<string, string | number |
   }
 
   if (!response?.ok) {
-    throw new Error(`365Scores HTTP ${response.status}: ${response.statusText}`);
+    throw new Error(response ? `365Scores HTTP ${response.status}: ${response.statusText}` : '365Scores request failed without a response');
   }
 
   return response.json() as Promise<T>;

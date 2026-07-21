@@ -105,19 +105,20 @@ eventsRouter.get('/event/:eventId/statistics', async (req, res) => {
     }
 
     // Adicionar URLs de imagem ao resposta
+    const providerData: any = statisticsData;
     const enhancedData = {
-      ...statisticsData,
+      ...providerData,
       homeTeam: {
-        ...statisticsData.homeTeam,
-        image: `/team/${statisticsData.homeTeam?.id}/image`,
-        imageSmall: `/team/${statisticsData.homeTeam?.id}/image/small`
+        ...providerData.homeTeam,
+        image: `/team/${providerData.homeTeam?.id}/image`,
+        imageSmall: `/team/${providerData.homeTeam?.id}/image/small`
       },
       awayTeam: {
-        ...statisticsData.awayTeam,
-        image: `/team/${statisticsData.awayTeam?.id}/image`,
-        imageSmall: `/team/${statisticsData.awayTeam?.id}/image/small`
+        ...providerData.awayTeam,
+        image: `/team/${providerData.awayTeam?.id}/image`,
+        imageSmall: `/team/${providerData.awayTeam?.id}/image/small`
       },
-      players: statisticsData.players?.map((player: any) => ({
+      players: providerData.players?.map((player: any) => ({
         ...player,
         image: `/player/${player.id}/image`,
         imageSmall: `/player/${player.id}/image/small`

@@ -164,6 +164,7 @@ export interface TimeInfo {
   initial: number;
   max: number;
   extra?: number;
+  current?: number;
 }
 
 export interface Changes {
@@ -228,6 +229,8 @@ export interface EventApiResponse {
 export interface NormalizedEvent {
   id: number;
   sourceProvider?: 'sofascore' | 'ogol' | '365scores' | 'aiscore';
+  liveMinute?: number;
+  providerStatus?: unknown;
   slug: string;
   status: {
     code: number;
